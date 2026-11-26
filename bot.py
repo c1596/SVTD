@@ -69,9 +69,24 @@ from aiogram.types import (
 # 1. КОНФИГУРАЦИЯ И КОНСТАНТЫ
 # ==============================================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "9149772940:AAGjZRlItcwcmWKOA9mUd_BDoj_IEkNfyzE")
-OWNER_ID = int(os.getenv("OWNER_ID", "5341904332"))  # Ваш Telegram ID (Главный владелец)
-DB_PATH = os.getenv("DB_PATH", "skibidi_verse.db")
+DEFAULT_BOT_TOKEN = "9149772940:AAGjZRlItcwcmWKOA9mUd_BDoj_IEkNfyzE"
+DEFAULT_OWNER_ID = 5341904332
+
+# Защита от пустых или некорректных переменных окружения на хостинге
+_env_token = (os.getenv("BOT_TOKEN") or "").strip().strip('"').strip("'")
+if (
+    ":" in _env_token
+    and _env_token.split(":", 1)[0].isdigit()
+    and _env_token.split(":", 1)[1]
+    and not any(ch.isspace() for ch in _env_token)
+):
+    BOT_TOKEN = _env_token
+else:
+    BOT_TOKEN = DEFAULT_BOT_TOKEN
+
+_env_owner = (os.getenv("OWNER_ID") or "").strip()
+OWNER_ID = int(_env_owner) if _env_owner.isdigit() else DEFAULT_OWNER_ID  # Ваш Telegram ID (Главный владелец)
+DB_PATH = (os.getenv("DB_PATH") or "").strip() or "skibidi_verse.db"
 
 MAX_DECK_SIZE = 4
 WORLD_BOSS_COOLDOWN = 60  # Секунд между ударами по Мировому Боссу
