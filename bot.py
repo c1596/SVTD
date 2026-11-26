@@ -3398,4 +3398,1381 @@ async def render_top(target: Message | CallbackQuery, mode: str = "trophies"):
         "coins": ("💰 Топ Богачей", "монет"),
         "bosses_killed": ("👹 Топ Охотников на Боссов", "боссов"),
     }
-    title, unit = titles.get(
+    title, unit = titles.get(mode, titles["trophies"])
+    leaders = await db.get_leaderboard(mode, limit=10)
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for idx, row in enumerate(leaders, 1):
+        m = medals[idx - 1] if idx <= 3 else f"{idx}."
+        extra = f" ({get_league(row['val'])})" if mode == "trophies" else ""
+        lines.append(f"{m} {format_user_link(row)} — <b>{row['val']}</b> {unit}{extra}")
+
+    text = f"{title}\n━━━━━━━━━━━━━━━━━━\n" + ("\n".join(lines) if lines else "<i>Список пока пуст.</i>")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🏆 Кубки", callback_data="top:trophies"),
+                InlineKeyboardButton(text="⚔️ PvP", callback_data="top:pvp_wins"),
+                InlineKeyboardButton(text="🦠 Зараж.", callback_data="top:infections_success"),
+            ],
+            [
+                InlineKeyboardButton(text="💰 Монеты", callback_data="top:coins"),
+                InlineKeyboardButton(text="👹 Боссы", callback_data="top:bosses_killed"),
+            ],
+        ]
+    )
+    await render_view(target, text, kb)
+
+
+@router.message(F.text == "🏆 Рейтинг")
+async def menu_top(message: Message, state: FSMContext):
+    await state.clear()
+    await render_top(message, "trophies")
+
+
+@router.callback_query(F.data.startswith("top:"))
+async def cb_top_switch(callback: CallbackQuery):
+    await render_top(callback, callback.data.split(":")[1])
+    await callback.answer()
+
+
+# ==============================================================================
+# 8. РАСШИРЕННАЯ АДМИН-ПАНЕЛЬ
+# ==============================================================================
+
+async def check_adm_perm(callback: CallbackQuery, perm: str) -> bool:
+    if not await db.has_perm(callback.from_user.id, perm):
+        await callback.answer("⛔️ У вас нет прав на этот раздел!", show_alert=True)
+        return False
+    return True
+
+
+async def render_admin_home(target: Message | CallbackQuery, user_id: int):
+    if not await db.is_admin(user_id):
+        return
+    perms = await db.get_admin_perms(user_id)
+    st = await db.get_global_stats()
+    maint = "🔴 ВКЛ" if GAME_SETTINGS.get("maintenance", "0") == "1" else "🟢 ВЫКЛ"
+    role = "👑 Владелец" if user_id == OWNER_ID else "👮 Администратор"
+
+    text = (
+        f"⚙️ <b>АДМИН-ПАНЕЛЬ</b> ({role})\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Игроков: <b>{st['users']}</b> | 🃏 Карт: <b>{st['cards']}</b> | 📦 Крейтов: <b>{st['crates']}</b>\n"
+        f"🎒 В инвентарях: <b>{st['inventory']}</b> | 🏪 На рынке: <b>{st['market']}</b>\n"
+        f"🛠 Техработы: <b>{maint}</b>\n"
+        f"🍀 Удача: <b>x{cfg_float('event_luck_mult')}</b> | 💰 Монеты: <b>x{cfg_float('event_coin_mult')}</b>"
+    )
+    rows: List[List[InlineKeyboardButton]] = []
+    if perms.get("manage_cards"):
+        rows.append([
+            InlineKeyboardButton(text="➕ Создать карту", callback_data="adm:card:new"),
+            InlineKeyboardButton(text="🃏 Список / Редактор", callback_data="adm:cards:0"),
+        ])
+    if perms.get("manage_crates"):
+        rows.append([InlineKeyboardButton(text="📦 Управление Крейтами", callback_data="adm:crates")])
+    if perms.get("manage_settings"):
+        rows.append([InlineKeyboardButton(text="🎛 Настройки баланса / Shiny / Ивенты", callback_data="adm:settings:0")])
+    if perms.get("manage_bosses"):
+        rows.append([InlineKeyboardButton(text="🌍 Мировой Босс", callback_data="adm:wb")])
+    if perms.get("manage_users") or perms.get("manage_economy"):
+        rows.append([InlineKeyboardButton(text="👥 Игроки и Экономика", callback_data="adm:users")])
+    if perms.get("broadcast"):
+        rows.append([InlineKeyboardButton(text="📢 Рассылка всем", callback_data="adm:broadcast")])
+    if perms.get("manage_admins"):
+        rows.append([
+            InlineKeyboardButton(text="👮 Админы", callback_data="adm:admins"),
+            InlineKeyboardButton(text="✍️ Сигнеры", callback_data="adm:signers"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text=f"🛠 Техработы: {maint}", callback_data="adm:maint"),
+            InlineKeyboardButton(text="💾 Скачать БД", callback_data="adm:backup"),
+        ])
+        rows.append([InlineKeyboardButton(text="📜 Лог действий админов", callback_data="adm:logs")])
+
+    await render_view(target, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.message(F.text == "⚙️ Админ-панель")
+async def menu_admin(message: Message, state: FSMContext):
+    if not await db.is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await render_admin_home(message, message.from_user.id)
+
+
+@router.callback_query(F.data == "adm:home")
+async def cb_adm_home(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await render_admin_home(callback, callback.from_user.id)
+    await callback.answer()
+
+
+# -------------------- КОНСТРУКТОР КАРТОЧЕК --------------------
+
+@router.callback_query(F.data == "adm:card:new")
+async def cb_adm_card_new(callback: CallbackQuery, state: FSMContext):
+    if not await check_adm_perm(callback, "manage_cards"):
+        return
+    await state.clear()
+    await state.set_state(CardCreateFSM.name)
+    await callback.message.answer("🃏 <b>Создание карты (1/9)</b>\nВведите <b>название</b> карточки:")
+    await callback.answer()
+
+
+@router.message(CardCreateFSM.name)
+async def fsm_cc_name(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if len(name) < 2 or len(name) > 60:
+        await message.answer("❌ Название от 2 до 60 символов.")
+        return
+    await state.update_data(name=name)
+    await state.set_state(CardCreateFSM.faction)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=v, callback_data=f"cc:fac:{k}")] for k, v in FACTIONS.items()]
+    )
+    await message.answer("🃏 <b>Шаг 2/9:</b> Выберите <b>фракцию</b>:", reply_markup=kb)
+
+
+@router.callback_query(CardCreateFSM.faction, F.data.startswith("cc:fac:"))
+async def fsm_cc_fac(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(faction=callback.data.split(":")[2])
+    await state.set_state(CardCreateFSM.rarity)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"{ico} {name}", callback_data=f"cc:rar:{k}")]
+            for k, (name, ico, _) in RARITIES.items()
+        ]
+    )
+    await render_view(callback, "🃏 <b>Шаг 3/9:</b> Выберите <b>редкость</b>:", kb)
+    await callback.answer()
+
+
+@router.callback_query(CardCreateFSM.rarity, F.data.startswith("cc:rar:"))
+async def fsm_cc_rar(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(rarity=callback.data.split(":")[2])
+    await state.set_state(CardCreateFSM.class_type)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"{ico} {k} — {desc[:32]}", callback_data=f"cc:cls:{k}")]
+            for k, (ico, desc) in CARD_CLASSES.items()
+        ]
+    )
+    await render_view(callback, "🃏 <b>Шаг 4/9:</b> Выберите <b>боевой класс</b>:", kb)
+    await callback.answer()
+
+
+@router.callback_query(CardCreateFSM.class_type, F.data.startswith("cc:cls:"))
+async def fsm_cc_cls(callback: CallbackQuery, state: FSMContext):
+    cls = callback.data.split(":")[2]
+    await state.update_data(class_type=cls, booster_dmg_mult=1.15, booster_hp_mult=1.15)
+    await state.set_state(CardCreateFSM.hp)
+    await render_view(callback, f"🃏 <b>Шаг 5/9:</b> Класс <b>{cls}</b>.\nВведите базовое <b>❤️ HP</b> (целое число):")
+    await callback.answer()
+
+
+@router.message(CardCreateFSM.hp)
+async def fsm_cc_hp(message: Message, state: FSMContext):
+    try:
+        hp = int((message.text or "").strip())
+        if hp <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите положительное число HP.")
+        return
+    await state.update_data(hp=hp)
+    await state.set_state(CardCreateFSM.atk)
+    cls = (await state.get_data()).get("class_type", "Single")
+    lbl = "💗 силу лечения" if cls == "Healer" else "⚔️ урон (ATK)"
+    await message.answer(f"🃏 <b>Шаг 6/9:</b> Введите базовую <b>{lbl}</b> (целое число):")
+
+
+@router.message(CardCreateFSM.atk)
+async def fsm_cc_atk(message: Message, state: FSMContext):
+    try:
+        atk = int((message.text or "").strip())
+        if atk < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите число >= 0.")
+        return
+    await state.update_data(atk=atk)
+    data = await state.get_data()
+    if data.get("class_type") == "Booster":
+        await state.set_state(CardCreateFSM.booster_mults)
+        await message.answer(
+            "✨ Для <b>Booster</b> введите два множителя через пробел (Урон HP), например: <code>1.20 1.15</code>"
+        )
+        return
+    await state.set_state(CardCreateFSM.description)
+    await message.answer("🃏 <b>Шаг 7/9:</b> Введите <b>описание</b> (или <code>-</code> чтобы пропустить):")
+
+
+@router.message(CardCreateFSM.booster_mults)
+async def fsm_cc_booster_mults(message: Message, state: FSMContext):
+    try:
+        parts = (message.text or "").replace(",", ".").split()
+        dm, hm = float(parts[0]), float(parts[1])
+        if not (1.0 <= dm <= 5.0 and 1.0 <= hm <= 5.0):
+            raise ValueError
+    except Exception:
+        await message.answer("❌ Формат: два числа от 1.0 до 5.0, например <code>1.2 1.15</code>")
+        return
+    await state.update_data(booster_dmg_mult=dm, booster_hp_mult=hm)
+    await state.set_state(CardCreateFSM.description)
+    await message.answer("🃏 <b>Шаг 7/9:</b> Введите <b>описание</b> (или <code>-</code> чтобы пропустить):")
+
+
+@router.message(CardCreateFSM.description)
+async def fsm_cc_desc(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    await state.update_data(description="" if raw == "-" else raw[:300])
+    await state.set_state(CardCreateFSM.image)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏭ Без фото", callback_data="cc:noimg")]])
+    await message.answer("🃏 <b>Шаг 8/9:</b> Отправьте <b>фото</b> карточки или нажмите «Без фото»:", reply_markup=kb)
+
+
+@router.callback_query(CardCreateFSM.image, F.data == "cc:noimg")
+async def fsm_cc_noimg(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(image_id="")
+    await ask_cc_is_boss(callback, state)
+    await callback.answer()
+
+
+@router.message(CardCreateFSM.image, F.photo)
+async def fsm_cc_img(message: Message, state: FSMContext):
+    await state.update_data(image_id=message.photo[-1].file_id)
+    await ask_cc_is_boss(message, state)
+
+
+async def ask_cc_is_boss(target: Message | CallbackQuery, state: FSMContext):
+    await state.set_state(CardCreateFSM.is_boss)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👹 Да, Босс рейда", callback_data="cc:boss:1"),
+                InlineKeyboardButton(text="🃏 Нет, обычная карта", callback_data="cc:boss:0"),
+            ]
+        ]
+    )
+    await render_view(target, "🃏 <b>Шаг 9/9:</b> Эта карта будет <b>Боссом рейда</b> с заражением?", kb)
+
+
+@router.callback_query(CardCreateFSM.is_boss, F.data.startswith("cc:boss:"))
+async def fsm_cc_is_boss(callback: CallbackQuery, state: FSMContext):
+    is_b = int(callback.data.split(":")[2])
+    await state.update_data(is_boss=is_b, boss_hp=0, boss_atk=0, infect_chance=0, infected_card_id=0)
+    if is_b == 1:
+        await state.set_state(CardCreateFSM.boss_hp)
+        await render_view(callback, "👹 Введите <b>HP Босса</b> в финальной волне рейда (например: 900):")
+    else:
+        await show_cc_preview(callback, state)
+    await callback.answer()
+
+
+@router.message(CardCreateFSM.boss_hp)
+async def fsm_cc_bhp(message: Message, state: FSMContext):
+    try:
+        v = int((message.text or "").strip())
+        if v <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите целое число > 0.")
+        return
+    await state.update_data(boss_hp=v)
+    await state.set_state(CardCreateFSM.boss_atk)
+    await message.answer("👹 Введите <b>урон (ATK) Босса</b> в рейде (например: 65):")
+
+
+@router.message(CardCreateFSM.boss_atk)
+async def fsm_cc_batk(message: Message, state: FSMContext):
+    try:
+        v = int((message.text or "").strip())
+        if v <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите целое число > 0.")
+        return
+    await state.update_data(boss_atk=v)
+    await state.set_state(CardCreateFSM.infect_chance)
+    await message.answer("🦠 Введите <b>базовый шанс заражения</b> в % (от 1 до 90):")
+
+
+@router.message(CardCreateFSM.infect_chance)
+async def fsm_cc_infch(message: Message, state: FSMContext):
+    try:
+        v = int((message.text or "").strip())
+        if not (1 <= v <= 95):
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите число от 1 до 95.")
+        return
+    await state.update_data(infect_chance=v)
+    await state.set_state(CardCreateFSM.infected_card_id)
+    cards = await db.list_cards()
+    sample = "\n".join(f"<code>{c['id']}</code> — {esc(c['name'])}" for c in cards[-12:])
+    await message.answer(
+        f"🔗 Введите <b>ID карты</b>, в которую превратится босс при заражении (или <code>0</code> — выдаст самого себя):\n\n{sample}"
+    )
+
+
+@router.message(CardCreateFSM.infected_card_id)
+async def fsm_cc_infid(message: Message, state: FSMContext):
+    try:
+        v = int((message.text or "").strip())
+        if v < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите число >= 0.")
+        return
+    await state.update_data(infected_card_id=v)
+    await show_cc_preview(message, state)
+
+
+async def show_cc_preview(target: Message | CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.set_state(CardCreateFSM.confirm)
+    preview = dict(data, id="NEW")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Сохранить карту", callback_data="cc:save"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="adm:home"),
+            ]
+        ]
+    )
+    await render_view(
+        target,
+        f"👁 <b>ПРЕВЬЮ НОВОЙ КАРТЫ</b>\n━━━━━━━━━━━━━━━━━━\n{format_card_text(preview)}",
+        kb,
+        photo=data.get("image_id") or None,
+    )
+
+
+@router.callback_query(CardCreateFSM.confirm, F.data == "cc:save")
+async def fsm_cc_save(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+    new_id = await db.create_card(data)
+    await db.log_admin(callback.from_user.id, f"Создал карту #{new_id} ({data['name']})")
+    await callback.answer(f"✅ Карта #{new_id} создана!", show_alert=True)
+    await render_adm_card_detail(callback, new_id, 0)
+
+
+# -------------------- СПИСОК, ТОЧЕЧНОЕ РЕДАКТИРОВАНИЕ И УДАЛЕНИЕ КАРТ --------------------
+
+async def render_adm_cards_list(target: Message | CallbackQuery, page: int = 0):
+    cards = await db.list_cards()
+    per_page = 8
+    total_pages = max(1, (len(cards) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    chunk = cards[page * per_page : (page + 1) * per_page]
+
+    rows = []
+    for c in chunk:
+        r_ico = RARITIES.get(c["rarity"], ("", "⚪️", 1))[1]
+        cls_ico = CARD_CLASSES.get(c.get("class_type", "Single"), ("🎯", ""))[0]
+        b_tag = "👹 " if c["is_boss"] else ""
+        rows.append([
+            InlineKeyboardButton(
+                text=f"#{c['id']} {b_tag}{r_ico}{cls_ico} {c['name']}",
+                callback_data=f"adm:cview:{c['id']}:{page}",
+            )
+        ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:cards:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm:cards:{page + 1}"))
+    rows.append(nav)
+    rows.append([
+        InlineKeyboardButton(text="➕ Новая карта", callback_data="adm:card:new"),
+        InlineKeyboardButton(text="🔙 Админка", callback_data="adm:home"),
+    ])
+    await render_view(target, f"🃏 <b>КАТАЛОГ КАРТ ({len(cards)})</b>\nВыберите карту для редактирования:", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("adm:cards:"))
+async def cb_adm_cards_list(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_cards"):
+        return
+    await render_adm_cards_list(callback, int(callback.data.split(":")[2]))
+    await callback.answer()
+
+
+async def render_adm_card_detail(target: Message | CallbackQuery, card_id: int, page: int = 0):
+    card = await db.get_card(card_id)
+    if not card:
+        await render_adm_cards_list(target, page)
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✏️ Название", callback_data=f"adm:cedit:{card_id}:name:{page}"),
+                InlineKeyboardButton(text="🖼 Фото", callback_data=f"adm:cedit:{card_id}:image_id:{page}"),
+            ],
+            [
+                InlineKeyboardButton(text="❤️ HP", callback_data=f"adm:cedit:{card_id}:hp:{page}"),
+                InlineKeyboardButton(text="⚔️ Урон", callback_data=f"adm:cedit:{card_id}:atk:{page}"),
+            ],
+            [
+                InlineKeyboardButton(text="🎭 Фракция", callback_data=f"adm:cpick:{card_id}:faction:{page}"),
+                InlineKeyboardButton(text="🌟 Редкость", callback_data=f"adm:cpick:{card_id}:rarity:{page}"),
+            ],
+            [
+                InlineKeyboardButton(text="⚔️ Класс", callback_data=f"adm:cpick:{card_id}:class_type:{page}"),
+                InlineKeyboardButton(text="📝 Описание", callback_data=f"adm:cedit:{card_id}:description:{page}"),
+            ],
+            [
+                InlineKeyboardButton(text="✨ Буст множ.", callback_data=f"adm:cedit:{card_id}:booster_mults:{page}"),
+                InlineKeyboardButton(text=f"👹 Босс: {'ДА' if card['is_boss'] else 'НЕТ'}", callback_data=f"adm:ctogboss:{card_id}:{page}"),
+            ],
+            [
+                InlineKeyboardButton(text="👹 HP/ATK Босса", callback_data=f"adm:cedit:{card_id}:boss_stats:{page}"),
+                InlineKeyboardButton(text="🦠 Шанс/ID Зар.", callback_data=f"adm:cedit:{card_id}:infect_cfg:{page}"),
+            ],
+            [
+                InlineKeyboardButton(text="🗑 Удалить карту", callback_data=f"adm:cdelask:{card_id}:{page}"),
+                InlineKeyboardButton(text="🔙 К списку", callback_data=f"adm:cards:{page}"),
+            ],
+        ]
+    )
+    await render_view(target, f"✏️ <b>РЕДАКТОР КАРТЫ</b>\n━━━━━━━━━━━━━━━━━━\n{format_card_text(card)}", kb, photo=card.get("image_id") or None)
+
+
+@router.callback_query(F.data.startswith("adm:cview:"))
+async def cb_adm_cview(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_cards"):
+        return
+    _, _, cid_s, page_s = callback.data.split(":")
+    await render_adm_card_detail(callback, int(cid_s), int(page_s))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:ctogboss:"))
+async def cb_adm_ctogboss(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_cards"):
+        return
+    _, _, cid_s, page_s = callback.data.split(":")
+    cid, page = int(cid_s), int(page_s)
+    c = await db.get_card(cid)
+    if c:
+        nxt = 0 if c["is_boss"] else 1
+        upd = {"is_boss": nxt}
+        if nxt == 1 and c["boss_hp"] <= 0:
+            upd.update({"boss_hp": max(400, c["hp"] * 2), "boss_atk": max(30, c["atk"]), "infect_chance": 15})
+        await db.update_card(cid, **upd)
+        await db.log_admin(callback.from_user.id, f"Переключил is_boss={nxt} у карты #{cid}")
+    await render_adm_card_detail(callback, cid, page)
+    await callback.answer("Обновлено!")
+
+
+@router.callback_query(F.data.startswith("adm:cpick:"))
+async def cb_adm_cpick(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_cards"):
+        return
+    _, _, cid_s, field, page_s = callback.data.split(":")
+    cid, page = int(cid_s), int(page_s)
+    rows = []
+    if field == "faction":
+        rows = [[InlineKeyboardButton(text=v, callback_data=f"adm:cset:{cid}:faction:{k}:{page}")] for k, v in FACTIONS.items()]
+    elif field == "rarity":
+        rows = [[InlineKeyboardButton(text=f"{ico} {n}", callback_data=f"adm:cset:{cid}:rarity:{k}:{page}")] for k, (n, ico, _) in RARITIES.items()]
+    elif field == "class_type":
+        rows = [[InlineKeyboardButton(text=f"{ico} {k}", callback_data=f"adm:cset:{cid}:class_type:{k}:{page}")] for k, (ico, _) in CARD_CLASSES.items()]
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"adm:cview:{cid}:{page}")])
+    await render_view(callback, f"Выберите новое значение для <b>{field}</b>:", InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:cset:"))
+async def cb_adm_cset(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_cards"):
+        return
+    _, _, cid_s, field, val, page_s = callback.data.split(":")
+    cid, page = int(cid_s), int(page_s)
+    await db.update_card(cid, **{field: val})
+    await db.log_admin(callback.from_user.id, f"Карта #{cid}: {field}={val}")
+    await render_adm_card_detail(callback, cid, page)
+    await callback.answer("✅ Сохранено!")
+
+
+@router.callback_query(F.data.startswith("adm:cedit:"))
+async def cb_adm_cedit(callback: CallbackQuery, state: FSMContext):
+    if not await check_adm_perm(callback, "manage_cards"):
+        return
+    _, _, cid_s, field, page_s = callback.data.split(":")
+    await state.set_state(CardEditFSM.waiting_value)
+    await state.update_data(cid=int(cid_s), field=field, page=int(page_s))
+    hints = {
+        "name": "Введите новое <b>название</b>:",
+        "image_id": "Отправьте новое <b>фото</b> (или <code>-</code> чтобы удалить фото):",
+        "hp": "Введите новое <b>❤️ HP</b>:",
+        "atk": "Введите новый <b>⚔️ Урон (или лечение)</b>:",
+        "description": "Введите новое <b>описание</b> (или <code>-</code> чтобы очистить):",
+        "booster_mults": "Введите два множителя Бустера через пробел (Урон HP), например: <code>1.25 1.20</code>",
+        "boss_stats": "Введите <b>HP и ATK Босса</b> через пробел, например: <code>1000 75</code>",
+        "infect_cfg": "Введите <b>Шанс(%) и ID заражённой карты</b> через пробел, например: <code>15 10</code>",
+    }
+    await callback.message.answer(f"✏️ {hints.get(field, 'Введите новое значение:')}")
+    await callback.answer()
+
+
+@router.message(CardEditFSM.waiting_value)
+async def fsm_card_edit_save(message: Message, state: FSMContext):
+    data = await state.get_data()
+    cid, field, page = data["cid"], data["field"], data["page"]
+    try:
+        if field == "image_id":
+            if message.photo:
+                await db.update_card(cid, image_id=message.photo[-1].file_id)
+            elif (message.text or "").strip() == "-":
+                await db.update_card(cid, image_id="")
+            else:
+                await message.answer("❌ Отправьте фото или <code>-</code>.")
+                return
+        elif field in ("hp", "atk"):
+            v = int((message.text or "").strip())
+            if v < 0:
+                raise ValueError
+            await db.update_card(cid, **{field: v})
+        elif field == "name":
+            v = (message.text or "").strip()
+            if len(v) < 2:
+                raise ValueError
+            await db.update_card(cid, name=v[:60])
+        elif field == "description":
+            raw = (message.text or "").strip()
+            await db.update_card(cid, description="" if raw == "-" else raw[:300])
+        elif field == "booster_mults":
+            p = (message.text or "").replace(",", ".").split()
+            await db.update_card(cid, booster_dmg_mult=float(p[0]), booster_hp_mult=float(p[1]))
+        elif field == "boss_stats":
+            p = (message.text or "").split()
+            await db.update_card(cid, boss_hp=int(p[0]), boss_atk=int(p[1]))
+        elif field == "infect_cfg":
+            p = (message.text or "").split()
+            await db.update_card(cid, infect_chance=max(0, min(95, int(p[0]))), infected_card_id=max(0, int(p[1])))
+    except Exception:
+        await message.answer("❌ Некорректный формат. Попробуйте ещё раз.")
+        return
+
+    await state.clear()
+    await db.log_admin(message.from_user.id, f"Изменил карту #{cid} ({field})")
+    await render_adm_card_detail(message, cid, page)
+
+
+@router.callback_query(F.data.startswith("adm:cdelask:"))
+async def cb_adm_cdelask(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_cards"):
+        return
+    _, _, cid_s, page_s = callback.data.split(":")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🗑 ДА, удалить навсегда", callback_data=f"adm:cdel:{cid_s}:{page_s}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:cview:{cid_s}:{page_s}"),
+            ]
+        ]
+    )
+    await render_view(callback, f"⚠️ Вы уверены, что хотите удалить карту <b>#{cid_s}</b>? Она исчезнет и из инвентарей!", kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:cdel:"))
+async def cb_adm_cdel(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_cards"):
+        return
+    _, _, cid_s, page_s = callback.data.split(":")
+    cid = int(cid_s)
+    await db.delete_card(cid)
+    await db.log_admin(callback.from_user.id, f"Удалил карту #{cid}")
+    await callback.answer("🗑 Карта удалена!", show_alert=True)
+    await render_adm_cards_list(callback, int(page_s))
+
+
+# -------------------- УПРАВЛЕНИЕ КРЕЙТАМИ --------------------
+
+async def render_adm_crates(target: Message | CallbackQuery):
+    crates = await db.list_crates(only_active=False)
+    rows = []
+    for cr in crates:
+        st = "🟢" if cr["active"] else "🔴"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{st} {cr['name']} — {cr['price']}💰 (✨{cr['shiny_chance']}%)",
+                callback_data=f"adm:crview:{cr['id']}",
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton(text="➕ Создать Крейт", callback_data="adm:crnew"),
+        InlineKeyboardButton(text="🔙 Админка", callback_data="adm:home"),
+    ])
+    await render_view(target, f"📦 <b>УПРАВЛЕНИЕ КРЕЙТАМИ ({len(crates)})</b>", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data == "adm:crates")
+async def cb_adm_crates(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_crates"):
+        return
+    await render_adm_crates(callback)
+    await callback.answer()
+
+
+async def render_adm_crate_detail(target: Message | CallbackQuery, crate_id: int):
+    cr = await db.get_crate(crate_id)
+    if not cr:
+        await render_adm_crates(target)
+        return
+    st = "🟢 Активен" if cr["active"] else "🔴 Скрыт"
+    text = (
+        f"📦 <b>КРЕЙТ #{cr['id']}: {esc(cr['name'])}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Статус: {st} | Цена: <b>{cr['price']} 💰</b> | ✨ Shiny: <b>{cr['shiny_chance']}%</b>\n"
+        f"Шансы редкостей: <code>{esc(cr['weights_json'])}</code>\n"
+        f"📝 <i>{esc(cr['description'])}</i>"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✏️ Название", callback_data=f"adm:credit:{crate_id}:name"),
+                InlineKeyboardButton(text="💰 Цена", callback_data=f"adm:credit:{crate_id}:price"),
+            ],
+            [
+                InlineKeyboardButton(text="🎲 Веса редкостей", callback_data=f"adm:credit:{crate_id}:weights_json"),
+                InlineKeyboardButton(text="✨ Шанс Shiny%", callback_data=f"adm:credit:{crate_id}:shiny_chance"),
+            ],
+            [
+                InlineKeyboardButton(text="👁 Вкл/Выкл", callback_data=f"adm:crtog:{crate_id}"),
+                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm:crdel:{crate_id}"),
+            ],
+            [InlineKeyboardButton(text="🔙 К крейтам", callback_data="adm:crates")],
+        ]
+    )
+    await render_view(target, text, kb)
+
+
+@router.callback_query(F.data.startswith("adm:crview:"))
+async def cb_adm_crview(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_crates"):
+        return
+    await render_adm_crate_detail(callback, int(callback.data.split(":")[2]))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:crtog:"))
+async def cb_adm_crtog(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_crates"):
+        return
+    cid = int(callback.data.split(":")[2])
+    cr = await db.get_crate(cid)
+    if cr:
+        await db.update_crate(cid, active=(0 if cr["active"] else 1))
+    await render_adm_crate_detail(callback, cid)
+    await callback.answer("Обновлено!")
+
+
+@router.callback_query(F.data.startswith("adm:crdel:"))
+async def cb_adm_crdel(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_crates"):
+        return
+    cid = int(callback.data.split(":")[2])
+    await db.delete_crate(cid)
+    await db.log_admin(callback.from_user.id, f"Удалил крейт #{cid}")
+    await callback.answer("🗑 Крейт удалён!", show_alert=True)
+    await render_adm_crates(callback)
+
+
+@router.callback_query(F.data.startswith("adm:credit:"))
+async def cb_adm_credit(callback: CallbackQuery, state: FSMContext):
+    if not await check_adm_perm(callback, "manage_crates"):
+        return
+    _, _, cid_s, field = callback.data.split(":")
+    await state.set_state(CrateFSM.edit_value)
+    await state.update_data(crate_id=int(cid_s), field=field)
+    if field == "weights_json":
+        hint = "Введите 6 чисел через пробел (common rare epic legendary mythic secret), например: <code>40 30 18 8 3 1</code>"
+    else:
+        hint = f"Введите новое значение для <b>{field}</b>:"
+    await callback.message.answer(f"✏️ {hint}")
+    await callback.answer()
+
+
+@router.message(CrateFSM.edit_value)
+async def fsm_crate_edit_save(message: Message, state: FSMContext):
+    data = await state.get_data()
+    cid, field = data["crate_id"], data["field"]
+    raw = (message.text or "").strip()
+    try:
+        if field == "price":
+            await db.update_crate(cid, price=max(1, int(raw)))
+        elif field == "shiny_chance":
+            await db.update_crate(cid, shiny_chance=max(0.0, min(100.0, float(raw.replace(",", ".")))))
+        elif field == "weights_json":
+            nums = [max(0, int(x)) for x in raw.split()]
+            if len(nums) != 6:
+                raise ValueError
+            keys = ["common", "rare", "epic", "legendary", "mythic", "secret"]
+            await db.update_crate(cid, weights_json=json.dumps(dict(zip(keys, nums))))
+        else:
+            await db.update_crate(cid, **{field: raw[:60]})
+    except Exception:
+        await message.answer("❌ Некорректный формат.")
+        return
+    await state.clear()
+    await db.log_admin(message.from_user.id, f"Изменил крейт #{cid} ({field})")
+    await render_adm_crate_detail(message, cid)
+
+
+@router.callback_query(F.data == "adm:crnew")
+async def cb_adm_crnew(callback: CallbackQuery, state: FSMContext):
+    if not await check_adm_perm(callback, "manage_crates"):
+        return
+    await state.set_state(CrateFSM.name)
+    await callback.message.answer("📦 Введите <b>название</b> нового крейта (например: <code>🔥 Огненный Кейс</code>):")
+    await callback.answer()
+
+
+@router.message(CrateFSM.name)
+async def fsm_cr_name(message: Message, state: FSMContext):
+    await state.update_data(name=(message.text or "Кейс").strip()[:50])
+    await state.set_state(CrateFSM.description)
+    await message.answer("📝 Введите краткое <b>описание</b> крейта:")
+
+
+@router.message(CrateFSM.description)
+async def fsm_cr_desc(message: Message, state: FSMContext):
+    await state.update_data(description=(message.text or "").strip()[:200])
+    await state.set_state(CrateFSM.price)
+    await message.answer("💰 Введите <b>цену</b> крейта в монетах:")
+
+
+@router.message(CrateFSM.price)
+async def fsm_cr_price(message: Message, state: FSMContext):
+    try:
+        p = int((message.text or "").strip())
+        if p <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите целое число > 0.")
+        return
+    await state.update_data(price=p)
+    await state.set_state(CrateFSM.weights)
+    await message.answer(
+        "🎲 Введите 6 весов редкостей через пробел (common rare epic legendary mythic secret):\n"
+        "Например: <code>45 30 15 7 2 1</code>"
+    )
+
+
+@router.message(CrateFSM.weights)
+async def fsm_cr_weights(message: Message, state: FSMContext):
+    try:
+        nums = [max(0, int(x)) for x in (message.text or "").split()]
+        if len(nums) != 6 or sum(nums) <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Нужно ровно 6 целых чисел (сумма > 0).")
+        return
+    keys = ["common", "rare", "epic", "legendary", "mythic", "secret"]
+    await state.update_data(weights=dict(zip(keys, nums)))
+    await state.set_state(CrateFSM.shiny_chance)
+    await message.answer("✨ Введите шанс выпадения <b>Shiny</b> в % (например: <code>1.0</code>):")
+
+
+@router.message(CrateFSM.shiny_chance)
+async def fsm_cr_shiny(message: Message, state: FSMContext):
+    try:
+        sh = float((message.text or "").replace(",", ".").strip())
+        if not (0.0 <= sh <= 100.0):
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Число от 0 до 100.")
+        return
+    d = await state.get_data()
+    await state.clear()
+    cid = await db.create_crate(d["name"], d["description"], d["price"], d["weights"], sh)
+    await db.log_admin(message.from_user.id, f"Создал крейт #{cid} ({d['name']})")
+    await render_adm_crate_detail(message, cid)
+
+
+# -------------------- НАСТРОЙКИ БАЛАНСА, SHINY, СИГН И ИВЕНТОВ --------------------
+
+async def render_adm_settings(target: Message | CallbackQuery, page: int = 0):
+    keys = list(SETTING_META.keys())
+    per_page = 6
+    total_pages = max(1, (len(keys) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    chunk = keys[page * per_page : (page + 1) * per_page]
+
+    rows = []
+    for k in chunk:
+        label = SETTING_META[k][0]
+        val = GAME_SETTINGS.get(k, DEFAULT_GAME_SETTINGS[k])
+        rows.append([InlineKeyboardButton(text=f"{label}: {val}", callback_data=f"adm:setedit:{k}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:settings:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm:settings:{page + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔙 Админка", callback_data="adm:home")])
+    await render_view(target, "🎛 <b>НАСТРОЙКИ БАЛАНСА И ИВЕНТОВ</b>\nНажмите параметр, чтобы изменить его:", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("adm:settings:"))
+async def cb_adm_settings(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_settings"):
+        return
+    await render_adm_settings(callback, int(callback.data.split(":")[2]))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:setedit:"))
+async def cb_adm_setedit(callback: CallbackQuery, state: FSMContext):
+    if not await check_adm_perm(callback, "manage_settings"):
+        return
+    _, _, key, page_s = callback.data.split(":")
+    if key not in SETTING_META:
+        return
+    label, typ, mn, mx = SETTING_META[key]
+    await state.set_state(AdminFSM.setting_value)
+    await state.update_data(set_key=key, set_page=int(page_s))
+    await callback.message.answer(
+        f"🎛 <b>{label}</b>\nТекущее: <code>{GAME_SETTINGS.get(key)}</code>\nВведите новое значение ({typ}, от {mn} до {mx}):"
+    )
+    await callback.answer()
+
+
+@router.message(AdminFSM.setting_value)
+async def fsm_adm_set_save(message: Message, state: FSMContext):
+    data = await state.get_data()
+    key, page = data["set_key"], data["set_page"]
+    label, typ, mn, mx = SETTING_META[key]
+    raw = (message.text or "").replace(",", ".").strip()
+    try:
+        val = int(float(raw)) if typ == "int" else round(float(raw), 2)
+        if not (mn <= val <= mx):
+            raise ValueError
+    except ValueError:
+        await message.answer(f"❌ Введите число от {mn} до {mx}.")
+        return
+    await state.clear()
+    await db.set_setting(key, str(val))
+    await db.log_admin(message.from_user.id, f"Настройка {key} = {val}")
+    await message.answer(f"✅ <b>{label}</b> изменено на <b>{val}</b>!")
+    await render_adm_settings(message, page)
+
+
+# -------------------- МИРОВОЙ БОСС (АДМИНКА) --------------------
+
+@router.callback_query(F.data == "adm:wb")
+async def cb_adm_wb(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_bosses"):
+        return
+    wb = await db.get_active_world_boss()
+    bosses = await db.list_cards(only_bosses=True)
+    status = f"🟢 Активен: <b>{esc(wb['name'])}</b> ({wb['current_hp']}/{wb['max_hp']} HP)" if wb else "⚪️ Сейчас не запущен"
+    rows = []
+    for b in bosses[:8]:
+        rows.append([InlineKeyboardButton(text=f"🚀 Запустить: {b['name']}", callback_data=f"adm:wbspawn:{b['id']}")])
+    if wb:
+        rows.append([InlineKeyboardButton(text="🛑 Остановить текущего Босса", callback_data="adm:wbstop")])
+    rows.append([InlineKeyboardButton(text="🔙 Админка", callback_data="adm:home")])
+    await render_view(callback, f"🌍 <b>УПРАВЛЕНИЕ МИРОВЫМ БОССОМ</b>\n{status}", InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:wbspawn:"))
+async def cb_adm_wbspawn(callback: CallbackQuery, state: FSMContext):
+    if not await check_adm_perm(callback, "manage_bosses"):
+        return
+    await state.set_state(AdminFSM.world_boss_hp)
+    await state.update_data(wb_card_id=int(callback.data.split(":")[2]))
+    await callback.message.answer("🌍 Введите <b>HP Мирового Босса</b> (например: <code>25000</code>):")
+    await callback.answer()
+
+
+@router.message(AdminFSM.world_boss_hp)
+async def fsm_adm_wb_hp(message: Message, state: FSMContext):
+    cid = (await state.get_data()).get("wb_card_id")
+    await state.clear()
+    try:
+        hp = int((message.text or "").strip())
+        if hp < 500:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите число >= 500.")
+        return
+    card = await db.get_card(cid)
+    if not card:
+        await message.answer("❌ Карта босса не найдена.")
+        return
+    await db.spawn_world_boss(cid, hp, max(50, card["boss_atk"]))
+    await db.log_admin(message.from_user.id, f"Запустил Мирового Босса {card['name']} ({hp} HP)")
+    await message.answer(f"🌍🚀 Мировой Босс <b>{esc(card['name'])}</b> ({hp} HP) запущен!")
+
+
+@router.callback_query(F.data == "adm:wbstop")
+async def cb_adm_wbstop(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_bosses"):
+        return
+    await db.stop_world_boss()
+    await db.log_admin(callback.from_user.id, "Остановил Мирового Босса")
+    await callback.answer("🛑 Мировой Босс остановлен!", show_alert=True)
+    await cb_adm_wb(callback)
+
+
+# -------------------- УПРАВЛЕНИЕ ИГРОКАМИ И ЭКОНОМИКОЙ --------------------
+
+@router.callback_query(F.data == "adm:users")
+async def cb_adm_users(callback: CallbackQuery, state: FSMContext):
+    if not (await db.has_perm(callback.from_user.id, "manage_users") or await db.has_perm(callback.from_user.id, "manage_economy")):
+        await callback.answer("⛔️ Нет прав!", show_alert=True)
+        return
+    await state.set_state(AdminFSM.find_user)
+    await callback.message.answer("👥 Введите <b>@username</b> или <b>Telegram ID</b> игрока для управления:")
+    await callback.answer()
+
+
+async def render_adm_user_card(target: Message | CallbackQuery, target_uid: int):
+    u = await db.get_user(target_uid)
+    if not u:
+        await render_view(target, "❌ Игрок не найден.")
+        return
+    ban_st = "🚫 ЗАБАНЕН" if u["is_banned"] else "🟢 Активен"
+    text = (
+        f"👤 <b>УПРАВЛЕНИЕ ИГРОКОМ</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{format_user_link(u)} | Статус: {ban_st}\n"
+        f"💰 Монеты: <b>{u['coins']}</b> | 🏆 Кубки: <b>{u['trophies']}</b>\n"
+        f"🦠 Паразиты: {u['p_common']} / {u['p_upgraded']} / {u['p_astro']}"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💰 +/- Монеты", callback_data=f"adm:ucoins:{target_uid}"),
+                InlineKeyboardButton(text="🃏 Выдать карту", callback_data=f"adm:ugivec:{target_uid}:0"),
+            ],
+            [
+                InlineKeyboardButton(text="+3 🦠 Обыч.", callback_data=f"adm:upara:{target_uid}:common"),
+                InlineKeyboardButton(text="+2 ☣️ Улучш.", callback_data=f"adm:upara:{target_uid}:upgraded"),
+                InlineKeyboardButton(text="+1 🌌 Астро", callback_data=f"adm:upara:{target_uid}:astro"),
+            ],
+            [
+                InlineKeyboardButton(text="🚫 Бан / Разбан", callback_data=f"adm:uban:{target_uid}"),
+                InlineKeyboardButton(text="🔙 Админка", callback_data="adm:home"),
+            ],
+        ]
+    )
+    await render_view(target, text, kb)
+
+
+@router.message(AdminFSM.find_user)
+async def fsm_adm_find_user(message: Message, state: FSMContext):
+    await state.clear()
+    u = await db.find_user(message.text or "")
+    if not u:
+        await message.answer("❌ Игрок не найден.")
+        return
+    await render_adm_user_card(message, u["user_id"])
+
+
+@router.callback_query(F.data.startswith("adm:ucoins:"))
+async def cb_adm_ucoins(callback: CallbackQuery, state: FSMContext):
+    if not await check_adm_perm(callback, "manage_economy"):
+        return
+    await state.set_state(AdminFSM.user_coins)
+    await state.update_data(target_uid=int(callback.data.split(":")[2]))
+    await callback.message.answer("💰 Введите сумму монет (например <code>1000</code> или <code>-500</code>):")
+    await callback.answer()
+
+
+@router.message(AdminFSM.user_coins)
+async def fsm_adm_ucoins_save(message: Message, state: FSMContext):
+    t_uid = (await state.get_data()).get("target_uid")
+    await state.clear()
+    try:
+        delta = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("❌ Введите целое число.")
+        return
+    await db.add_coins(t_uid, delta)
+    await db.log_admin(message.from_user.id, f"Изменил баланс {t_uid} на {delta:+d}💰")
+    await render_adm_user_card(message, t_uid)
+
+
+@router.callback_query(F.data.startswith("adm:upara:"))
+async def cb_adm_upara(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_economy"):
+        return
+    _, _, uid_s, p_type = callback.data.split(":")
+    t_uid = int(uid_s)
+    qty = 3 if p_type == "common" else (2 if p_type == "upgraded" else 1)
+    await db.add_parasite(t_uid, p_type, qty)
+    await db.log_admin(callback.from_user.id, f"Выдал +{qty} {p_type} игроку {t_uid}")
+    await callback.answer(f"✅ Выдано +{qty}!", show_alert=True)
+    await render_adm_user_card(callback, t_uid)
+
+
+@router.callback_query(F.data.startswith("adm:uban:"))
+async def cb_adm_uban(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_users"):
+        return
+    t_uid = int(callback.data.split(":")[2])
+    if t_uid == OWNER_ID:
+        await callback.answer("Нельзя забанить владельца!", show_alert=True)
+        return
+    u = await db.get_user(t_uid)
+    if u:
+        nxt = 0 if u["is_banned"] else 1
+        await db.update_user(t_uid, is_banned=nxt)
+        await db.log_admin(callback.from_user.id, f"Бан={nxt} для игрока {t_uid}")
+    await render_adm_user_card(callback, t_uid)
+    await callback.answer("Статус обновлён!")
+
+
+@router.callback_query(F.data.startswith("adm:ugivec:"))
+async def cb_adm_ugivec(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_economy"):
+        return
+    _, _, uid_s, page_s = callback.data.split(":")
+    t_uid, page = int(uid_s), int(page_s)
+    cards = await db.list_cards()
+    per_page = 8
+    total_pages = max(1, (len(cards) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    chunk = cards[page * per_page : (page + 1) * per_page]
+
+    rows = [
+        [InlineKeyboardButton(text=f"#{c['id']} {c['name']}", callback_data=f"adm:ugivepick:{t_uid}:{c['id']}")]
+        for c in chunk
+    ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:ugivec:{t_uid}:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm:ugivec:{t_uid}:{page + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔙 К игроку", callback_data=f"adm:uopen:{t_uid}")])
+    await render_view(callback, f"🎁 Выберите карту для выдачи игроку <code>{t_uid}</code>:", InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:uopen:"))
+async def cb_adm_uopen(callback: CallbackQuery):
+    await render_adm_user_card(callback, int(callback.data.split(":")[2]))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:ugivepick:"))
+async def cb_adm_ugivepick(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_economy"):
+        return
+    _, _, uid_s, cid_s = callback.data.split(":")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⚪️ Обычная", callback_data=f"adm:ugivedo:{uid_s}:{cid_s}:none:none")],
+            [InlineKeyboardButton(text="✨ Shiny", callback_data=f"adm:ugivedo:{uid_s}:{cid_s}:shiny:none")],
+            [InlineKeyboardButton(text="🦠 Обыч. Инфектед", callback_data=f"adm:ugivedo:{uid_s}:{cid_s}:none:normal")],
+            [InlineKeyboardButton(text="🌌 Астро-Инфектед", callback_data=f"adm:ugivedo:{uid_s}:{cid_s}:none:astro")],
+            [InlineKeyboardButton(text="✨🌌 Shiny Астро-Инфектед", callback_data=f"adm:ugivedo:{uid_s}:{cid_s}:shiny:astro")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data=f"adm:ugivec:{uid_s}:0")],
+        ]
+    )
+    await render_view(callback, "Выберите вариант выдачи карты:", kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:ugivedo:"))
+async def cb_adm_ugivedo(callback: CallbackQuery, bot: Bot):
+    if not await check_adm_perm(callback, "manage_economy"):
+        return
+    _, _, uid_s, cid_s, mut, inf_t = callback.data.split(":")
+    t_uid, cid = int(uid_s), int(cid_s)
+    card = await db.get_card(cid)
+    if not card:
+        await callback.answer("Карта не найдена.", show_alert=True)
+        return
+    await db.give_card(t_uid, cid, mutation=mut, infected_type=inf_t)
+    await db.log_admin(callback.from_user.id, f"Выдал карту #{cid} ({mut}/{inf_t}) игроку {t_uid}")
+    try:
+        await bot.send_message(t_uid, f"🎁 Администрация выдала вам карту: <b>{esc(card['name'])}</b>!")
+    except Exception:
+        pass
+    await callback.answer("✅ Карта выдана!", show_alert=True)
+    await render_adm_user_card(callback, t_uid)
+
+
+# -------------------- АДМИНЫ, ПАРТНЁРЫ-СИГНЕРЫ, РАССЫЛКА И БД --------------------
+
+async def render_adm_admins(target: Message | CallbackQuery):
+    admins = await db.list_admins()
+    rows = []
+    for a in admins:
+        name = a["full_name"] or str(a["user_id"])
+        rows.append([InlineKeyboardButton(text=f"👮 {name} ({a['user_id']})", callback_data=f"adm:aperms:{a['user_id']}")])
+    rows.append([
+        InlineKeyboardButton(text="➕ Добавить админа", callback_data="adm:aadd"),
+        InlineKeyboardButton(text="🔙 Админка", callback_data="adm:home"),
+    ])
+    await render_view(target, f"👮 <b>АДМИНИСТРАТОРЫ ({len(admins)})</b>\nНажмите на админа, чтобы переключить права:", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data == "adm:admins")
+async def cb_adm_admins(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_admins"):
+        return
+    await render_adm_admins(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:aadd")
+async def cb_adm_aadd(callback: CallbackQuery, state: FSMContext):
+    if not await check_adm_perm(callback, "manage_admins"):
+        return
+    await state.set_state(AdminFSM.add_admin)
+    await callback.message.answer("👮 Введите <b>@username</b> или <b>Telegram ID</b> нового администратора:")
+    await callback.answer()
+
+
+@router.message(AdminFSM.add_admin)
+async def fsm_adm_aadd(message: Message, state: FSMContext):
+    await state.clear()
+    u = await db.find_user(message.text or "")
+    if not u:
+        await message.answer("❌ Игрок не найден в базе (он должен сначала нажать /start).")
+        return
+    await db.add_admin(u["user_id"], message.from_user.id)
+    await db.log_admin(message.from_user.id, f"Назначил админом {u['user_id']}")
+    await render_adm_admin_perms(message, u["user_id"])
+
+
+async def render_adm_admin_perms(target: Message | CallbackQuery, target_uid: int):
+    perms = await db.get_admin_perms(target_uid)
+    u = await db.get_user(target_uid)
+    title = format_user_link(u) if u else f"<code>{target_uid}</code>"
+    rows = []
+    for p_key, p_desc in ADMIN_PERMS.items():
+        ico = "✅" if perms.get(p_key) else "❌"
+        rows.append([InlineKeyboardButton(text=f"{ico} {p_desc}", callback_data=f"adm:atog:{target_uid}:{p_key}")])
+    rows.append([
+        InlineKeyboardButton(text="🗑 Снять админа", callback_data=f"adm:adel:{target_uid}"),
+        InlineKeyboardButton(text="🔙 К списку", callback_data="adm:admins"),
+    ])
+    await render_view(target, f"👮 <b>ПРАВА АДМИНА:</b> {title}", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("adm:aperms:"))
+async def cb_adm_aperms(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_admins"):
+        return
+    await render_adm_admin_perms(callback, int(callback.data.split(":")[2]))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:atog:"))
+async def cb_adm_atog(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_admins"):
+        return
+    _, _, uid_s, p_key = callback.data.split(":")
+    t_uid = int(uid_s)
+    await db.toggle_admin_perm(t_uid, p_key)
+    await db.log_admin(callback.from_user.id, f"Переключил право {p_key} у {t_uid}")
+    await render_adm_admin_perms(callback, t_uid)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:adel:"))
+async def cb_adm_adel(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_admins"):
+        return
+    t_uid = int(callback.data.split(":")[2])
+    await db.remove_admin(t_uid)
+    await db.log_admin(callback.from_user.id, f"Снял админа {t_uid}")
+    await callback.answer("🗑 Администратор снят!", show_alert=True)
+    await render_adm_admins(callback)
+
+
+# --- СИГНЕРЫ (ПАРТНЁРЫ +10% И АДМИНЫ +20%) ---
+
+async def render_adm_signers(target: Message | CallbackQuery):
+    signers = await db.list_signers()
+    rows = []
+    for s in signers:
+        ico = "👑" if s["role"] == "admin" else "🤝"
+        name = s["full_name"] or str(s["user_id"])
+        rows.append([InlineKeyboardButton(text=f"❌ Убрать {ico} {name}", callback_data=f"adm:sdel:{s['user_id']}")])
+    rows.append([
+        InlineKeyboardButton(text="➕ Партнёр (+10%)", callback_data="adm:sadd:partner"),
+        InlineKeyboardButton(text="➕ Админ-Сигнер (+20%)", callback_data="adm:sadd:admin"),
+    ])
+    rows.append([InlineKeyboardButton(text="🔙 Админка", callback_data="adm:home")])
+    await render_view(target, f"✍️ <b>СИГНЕРЫ ({len(signers)})</b>\nНажмите на сигнера, чтобы снять права:", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data == "adm:signers")
+async def cb_adm_signers(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_admins"):
+        return
+    await render_adm_signers(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:sadd:"))
+async def cb_adm_sadd(callback: CallbackQuery, state: FSMContext):
+    if not await check_adm_perm(callback, "manage_admins"):
+        return
+    role = callback.data.split(":")[2]
+    await state.set_state(AdminFSM.add_signer)
+    await state.update_data(signer_role=role)
+    await callback.message.answer(f"✍️ Введите <b>@username</b> или <b>ID</b> игрока для выдачи роли <b>{role}</b>:")
+    await callback.answer()
+
+
+@router.message(AdminFSM.add_signer)
+async def fsm_adm_sadd(message: Message, state: FSMContext):
+    role = (await state.get_data()).get("signer_role", "partner")
+    await state.clear()
+    u = await db.find_user(message.text or "")
+    if not u:
+        await message.answer("❌ Игрок не найден.")
+        return
+    await db.set_signer(u["user_id"], role, message.from_user.id)
+    await db.log_admin(message.from_user.id, f"Выдал роль сигнера ({role}) игроку {u['user_id']}")
+    await render_adm_signers(message)
+
+
+@router.callback_query(F.data.startswith("adm:sdel:"))
+async def cb_adm_sdel(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_admins"):
+        return
+    uid = int(callback.data.split(":")[2])
+    await db.remove_signer(uid)
+    await db.log_admin(callback.from_user.id, f"Снял сигнера {uid}")
+    await render_adm_signers(callback)
+    await callback.answer("Снято!")
+
+
+# --- РАССЫЛКА, ТЕХРАБОТЫ, ЛОГИ, БЭКАП И ВОССТАНОВЛЕНИЕ БД ---
+
+@router.callback_query(F.data == "adm:broadcast")
+async def cb_adm_broadcast(callback: CallbackQuery, state: FSMContext):
+    if not await check_adm_perm(callback, "broadcast"):
+        return
+    await state.set_state(AdminFSM.broadcast)
+    await callback.message.answer("📢 Отправьте сообщение (текст или фото с подписью) для рассылки всем игрокам:")
+    await callback.answer()
+
+
+@router.message(AdminFSM.broadcast)
+async def fsm_adm_broadcast(message: Message, state: FSMContext):
+    await state.clear()
+    uids = await db.get_all_active_user_ids()
+    ok = 0
+    for uid in uids:
+        try:
+            await message.send_copy(chat_id=uid)
+            ok += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+    await db.log_admin(message.from_user.id, f"Рассылка: доставлено {ok}/{len(uids)}")
+    await message.answer(f"✅ Рассылка завершена: <b>{ok}/{len(uids)}</b> доставлено.")
+
+
+@router.callback_query(F.data == "adm:maint")
+async def cb_adm_maint(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_admins"):
+        return
+    nxt = "0" if GAME_SETTINGS.get("maintenance", "0") == "1" else "1"
+    await db.set_setting("maintenance", nxt)
+    await db.log_admin(callback.from_user.id, f"Техработы={nxt}")
+    await render_admin_home(callback, callback.from_user.id)
+    await callback.answer("Обновлено!")
+
+
+@router.callback_query(F.data == "adm:logs")
+async def cb_adm_logs(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_admins"):
+        return
+    logs = await db.get_admin_logs(limit=15)
+    lines = []
+    for l in logs:
+        dt = datetime.fromtimestamp(l["created_at"]).strftime("%d.%m %H:%M") if l["created_at"] else ""
+        who = esc(l["full_name"] or str(l["admin_id"]))
+        lines.append(f"<code>{dt}</code> <b>{who}</b>: {esc(l['action'])}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Админка", callback_data="adm:home")]])
+    await render_view(callback, "📜 <b>ПОСЛЕДНИЕ ДЕЙСТВИЯ АДМИНОВ</b>\n━━━━━━━━━━━━━━━━━━\n" + ("\n".join(lines) or "<i>Пусто</i>"), kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:backup")
+async def cb_adm_backup(callback: CallbackQuery):
+    if not await check_adm_perm(callback, "manage_admins"):
+        return
+    if os.path.exists(DB_PATH):
+        await callback.message.answer_document(
+            FSInputFile(DB_PATH),
+            caption="💾 Бэкап БД. Чтобы восстановить БД — просто отправьте .db файл боту.",
+        )
+    await callback.answer()
+
+
+@router.message(F.document)
+async def handle_db_restore(message: Message, bot: Bot):
+    if message.from_user.id != OWNER_ID:
+        return
+    doc = message.document
+    if not doc or not (doc.file_name or "").endswith(".db"):
+        return
+    file = await bot.get_file(doc.file_id)
+    for ext in ("-wal", "-shm", "-journal"):
+        try:
+            os.remove(f"{DB_PATH}{ext}")
+        except OSError:
+            pass
+    await bot.download_file(file.file_path, DB_PATH)
+    await db.init()
+    await message.answer("✅ <b>База данных успешно восстановлена и мигрирована!</b>")
+
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+# ==============================================================================
+# 9. ФОНОВЫЕ ЗАДАЧИ И ТОЧКА ВХОДА
+# ==============================================================================
+
+async def auto_backup_loop(bot: Bot) -> None:
+    while True:
+        await asyncio.sleep(12 * 3600)
+        try:
+            if os.path.exists(DB_PATH):
+                await bot.send_document(OWNER_ID, FSInputFile(DB_PATH), caption="💾 Автобэкап БД Skibidi Verse.")
+        except Exception as exc:
+            logger.warning("Auto backup failed: %s", exc)
+
+
+async def main() -> None:
+    await db.init()
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.message.middleware(AccessMiddleware())
+    dp.callback_query.middleware(AccessMiddleware())
+    dp.include_router(router)
+
+    asyncio.create_task(auto_backup_loop(bot))
+    logger.info("🚀 Skibidi Verse Tower Defense Bot запущен! Владелец: %s", OWNER_ID)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Бот остановлен.")
