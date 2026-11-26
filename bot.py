@@ -44,8 +44,8 @@ from aiogram.types import (
 # 1. КОНФИГУРАЦИЯ И КОНСТАНТЫ
 # ==============================================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
-OWNER_ID = int(os.getenv("OWNER_ID", "123456789"))  # Ваш Telegram ID (Главный владелец)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9149772940:AAGjZRlItcwcmWKOA9mUd_BDoj_IEkNfyzE")
+OWNER_ID = int(os.getenv("OWNER_ID", "5341904332"))  # Ваш Telegram ID (Главный владелец)
 DB_PATH = os.getenv("DB_PATH", "skibidi_verse.db")
 
 MAX_DECK_SIZE = 4
