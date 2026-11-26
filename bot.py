@@ -12,13 +12,38 @@ Skibidi Verse Tower Defense — Telegram RPG / Card PvP & Boss Infection Bot
 
 import asyncio
 import html
+import importlib
+import importlib.util
 import json
 import logging
 import os
 import random
+import subprocess
+import sys
 import time
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+
+
+def ensure_dependencies(packages: Dict[str, str]) -> None:
+    """Проверяет наличие нужных библиотек и при их отсутствии устанавливает их через pip."""
+    missing = [
+        pip_spec
+        for module_name, pip_spec in packages.items()
+        if importlib.util.find_spec(module_name) is None
+    ]
+    if missing:
+        print(f"📦 Установка отсутствующих библиотек: {', '.join(missing)}...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+            importlib.invalidate_caches()
+            print("✅ Библиотеки успешно установлены!")
+        except Exception as exc:
+            print(f"❌ Ошибка при установке библиотек: {exc}")
+            sys.exit(1)
+
+
+ensure_dependencies({"aiogram": "aiogram>=3.0.0", "aiosqlite": "aiosqlite"})
 
 import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
