@@ -3,16 +3,15 @@ Skibidi Verse: Cards & Infection — Telegram Card RPG Bot
 Стек: Python 3.10+, aiogram 3.x, aiosqlite (автоматическая установка при запуске).
 
 Возможности:
-- Статичное нижнее меню + инлайн-управление без команд
-- 4×4 бои за Скибиди-Туалетов против отрядов Альянса (без пропуска боя, кнопка «Сдаться»)
-- 31 ранг Скибиди-Туалетов (чем выше ранг, тем выше награды и шанс заражения)
-- Заражение врагов при убийстве в бою по дробной формуле (% от базового числа)
-- Уровни карт за нанесённый урон (1 урон = 0.1 XP, макс 50 ур., +0.5% к урону/ур.)
-- ✨ Shiny мутация, серийные номера [#0001] на Mythic/Secret, Админ (+10%) и Партнёр (+5%) сигны
-- Инвентарь и Индекс в стиле GGTD Cards (стаки, фильтры, Существует/Shiny/Инфектед, пересчёт от удачи)
+- Меню 3×3 (Колода / Играть / Инвентарь | Профиль / Крейты / Индекс | Лидерборд / Админ-панель / Мультиплеер) с возможностью скрытия
+- Чистый старт: 0 юнитов, 0 крейтов, 100 монет — всё создаётся через расширенную Админ-панель
+- Конструктор редкостей (Common, Uncommon, Rare, Epic, Legendary, Mythic, Secret + кастомные)
+- Английские названия классов (Single, AOE, Splash, Fire, Booster, Healer), редкостей и счётчик Exist
+- 4×4 бои за Скибиди-Туалетов против отрядов Альянса (без пропуска, 31 ранг, заражение при убийстве)
+- Индекс (до 8 карт на страницу) и Инвентарь в стиле GGTD Cards
 - Массовая покупка и крафт паразитов (x1, x3, x5, x10, x25, МАКС) + Крейты + Кастомные валюты
-- Мировой Босс, P2P-рынок (80% продавцу / 20% комиссия владельцу), Ивенты Удачи и Монет
-- Расширенная Админ-панель с гибкими правами, логами и бэкапом/восстановлением БД
+- Система дочерних ботов (/linkbot — до 2 ботов на игрока) + полный контроль в Админ-панели
+- P2P-рынок (80% продавцу / 20% комиссия владельцу), Мировой Босс, Ивенты Удачи и Монет, Бэкап БД
 """
 
 import asyncio
@@ -21,9 +20,9 @@ import importlib
 import importlib.util
 import json
 import logging
-import math
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -56,12 +55,18 @@ import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramConflictError,
+    TelegramRetryAfter,
+    TelegramUnauthorizedError,
+)
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
@@ -69,6 +74,7 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     TelegramObject,
 )
 
@@ -96,13 +102,16 @@ DB_PATH = (os.getenv("DB_PATH") or "").strip() or "skibidi_cards.db"
 
 MAX_DECK_SIZE = 4
 MAX_CARD_LEVEL = 50
-XP_PER_DAMAGE = 0.1         # 1 урон = 0.1 XP карте
-DMG_PCT_PER_LEVEL = 0.5     # +0.5% к урону за каждый уровень свыше 1
-MARKET_COMMISSION_PCT = 20  # 20% комиссия владельцу, 80% продавцу
+XP_PER_DAMAGE = 0.1           # 1 урон = 0.1 XP карте
+DMG_PCT_PER_LEVEL = 0.5       # +0.5% к урону за каждый уровень свыше 1
+MARKET_COMMISSION_PCT = 20    # 20% комиссия владельцу, 80% продавцу
 DAILY_COOLDOWN = 86400
+MAX_CHILD_BOTS_PER_USER = 2
+INITIAL_COINS = 100
 
 DEFAULT_SETTINGS: Dict[str, str] = {
     "maintenance": "0",
+    "allow_child_bots": "1",
     "infected_mult": "1.20",
     "shiny_chance_pct": "1.0",
     "shiny_bonus_pct": "25",
@@ -125,7 +134,7 @@ DEFAULT_SETTINGS: Dict[str, str] = {
 GAME_SETTINGS: Dict[str, str] = dict(DEFAULT_SETTINGS)
 
 SETTING_META: Dict[str, Tuple[str, str, float, float]] = {
-    "infected_mult": ("🦠 Множитель Инфектед", "float", 1.0, 5.0),
+    "infected_mult": ("🦠 Множитель Infected", "float", 1.0, 5.0),
     "shiny_chance_pct": ("✨ Шанс Shiny (%)", "float", 0.1, 100.0),
     "shiny_bonus_pct": ("✨ Бонус Shiny (%)", "int", 5, 200),
     "admin_sign_pct": ("👑 Админ-сигна (+% ATK/HP)", "int", 1, 100),
@@ -140,26 +149,28 @@ SETTING_META: Dict[str, Tuple[str, str, float, float]] = {
     "wb_cooldown_sec": ("🌍 КД Мирового Босса (сек)", "int", 5, 600),
 }
 
-# Редкости: key -> (название, эмодзи, вес, базовый шанс заражения %)
-RARITIES: Dict[str, Tuple[str, str, int, float]] = {
-    "common": ("Обычная", "⚪️", 1, 1.0),
-    "uncommon": ("Необычная", "🟢", 2, 0.5),
-    "rare": ("Редкая", "🔵", 3, 0.25),
-    "epic": ("Эпическая", "🟣", 4, 0.125),
-    "legendary": ("Легендарная", "🟡", 5, 0.0625),
-    "mythic": ("Мифическая", "🔴", 6, 0.03125),
-    "secret": ("Секретная", "⬛", 7, 0.015625),
-}
+# Базовые редкости на английском (сидятся в таблицу rarities, можно добавлять/редактировать/удалять)
+DEFAULT_RARITIES: List[Tuple[str, str, str, int, float, int]] = [
+    ("common", "Common", "⚪️", 1, 1.0, 0),
+    ("uncommon", "Uncommon", "🟢", 2, 0.5, 0),
+    ("rare", "Rare", "🔵", 3, 0.25, 0),
+    ("epic", "Epic", "🟣", 4, 0.125, 0),
+    ("legendary", "Legendary", "🟡", 5, 0.0625, 0),
+    ("mythic", "Mythic", "🔴", 6, 0.03125, 1),
+    ("secret", "Secret", "⬛", 7, 0.015625, 1),
+]
 
-SERIAL_RARITIES: Set[str] = {"mythic", "secret"}
+# Динамический кэш редкостей из БД: key -> dict
+RARITIES_CACHE: Dict[str, Dict[str, Any]] = {}
 
 FACTIONS: Dict[str, str] = {
-    "skibidi": "🚽 Скибиди",
-    "astro": "🌌 Астро-Скибиди",
-    "alliance": "📷 Альянс",
-    "infected": "🦠 Заражённые",
+    "skibidi": "🚽 Skibidi",
+    "astro": "🌌 Astro",
+    "alliance": "📷 Alliance",
+    "infected": "🦠 Infected",
 }
 
+# Классы строго на английском (названия) + краткое описание
 CARD_CLASSES: Dict[str, Tuple[str, str]] = {
     "Single": ("🎯", "Сильный удар по 1 цели"),
     "AOE": ("🌪", "Удар по всем живым врагам"),
@@ -210,16 +221,14 @@ SKIBIDI_RANKS: List[Tuple[str, int, float, float, int]] = [
     ("🌌 Астро-Скибиди VII", 15000, 72.00, 10.00, 300),
 ]
 
-# Сложности: key -> (название, множ. статов ИИ, множ. кубков/монет, сдвиг редкости, +бонус зараж.%)
 DIFFICULTIES: Dict[str, Tuple[str, float, float, int, int]] = {
-    "easy": ("🟢 Лёгкий", 0.8, 0.6, -1, 0),
-    "med": ("🟡 Средний", 1.1, 1.0, 0, 5),
-    "hard": ("🔴 Сложный", 1.6, 1.4, 1, 12),
-    "nightmare": ("☠️ Кошмар", 2.2, 1.8, 2, 22),
+    "easy": ("🟢 Easy", 0.8, 0.6, -1, 0),
+    "med": ("🟡 Medium", 1.1, 1.0, 0, 5),
+    "hard": ("🔴 Hard", 1.6, 1.4, 1, 12),
+    "nightmare": ("☠️ Nightmare", 2.2, 1.8, 2, 22),
     "crazy": ("🤯 Crazy", 3.5, 2.5, 2, 35),
 }
 
-# Модификаторы боя: key -> (название, дельта монет, дельта кубков, +бонус заражения %)
 BATTLE_MODS: Dict[str, Tuple[str, float, float, int]] = {
     "mod_enemy_hp": ("🔴 1.5x HP врагов (+30%💰/🏆, +8%🦠)", 0.30, 0.30, 8),
     "mod_enemy_stats": ("🔴 1.25x Статы ИИ (+25%💰/🏆, +6%🦠)", 0.25, 0.25, 6),
@@ -230,6 +239,7 @@ BATTLE_MODS: Dict[str, Tuple[str, float, float, int]] = {
 
 ADMIN_PERMS: Dict[str, str] = {
     "manage_cards": "🃏 Карты (создание/редактор/удаление)",
+    "manage_rarities": "🌟 Редкости (создание/редактор/удаление)",
     "manage_crates": "📦 Крейты",
     "manage_currencies": "🪙 Валюты и дроп из боёв",
     "manage_events": "🎉 Ивенты (Удача / Монеты)",
@@ -239,11 +249,14 @@ ADMIN_PERMS: Dict[str, str] = {
     "manage_users": "👥 Игроки и баны",
     "broadcast": "📢 Рассылка",
     "sign_admin": "👑 Админ-сигна (+10% ATK/HP)",
+    "manage_child_bots": "🤖 Управление дочерними ботами",
     "manage_admins": "👮 Админы, Партнёры, техработы, БД",
 }
 
 ACTIVE_BATTLES: Dict[str, Dict[str, Any]] = {}
 USERS_IN_BATTLE: Set[int] = set()
+MAIN_BOT: Optional[Bot] = None
+MAIN_DP: Optional[Dispatcher] = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("skibidi_cards")
@@ -263,8 +276,18 @@ def cfg_int(k: str) -> int:
         return int(float(DEFAULT_SETTINGS[k]))
 
 
+def get_rarity(key: str) -> Dict[str, Any]:
+    """Безопасно возвращает параметры редкости из кэша."""
+    if key in RARITIES_CACHE:
+        return RARITIES_CACHE[key]
+    return {"key": key, "name": key.capitalize(), "emoji": "⚪️", "weight": 1, "infect_chance": 1.0, "has_serial": 0}
+
+
+def sorted_rarities(reverse: bool = False) -> List[Dict[str, Any]]:
+    return sorted(RARITIES_CACHE.values(), key=lambda r: (r["weight"], r["name"]), reverse=reverse)
+
+
 def get_active_events() -> Tuple[float, int, float, int]:
-    """Возвращает (luck_mult, luck_left_sec, coin_mult, coin_left_sec)."""
     now = int(time.time())
     l_end = cfg_int("luck_event_end")
     c_end = cfg_int("coin_event_end")
@@ -274,7 +297,6 @@ def get_active_events() -> Tuple[float, int, float, int]:
 
 
 def get_rank_info(trophies: int) -> Tuple[int, str, float, float, int]:
-    """Возвращает (индекс 0..30, название, diff_mult, reward_mult, infect_bonus_pct)."""
     res = (0, SKIBIDI_RANKS[0][0], SKIBIDI_RANKS[0][2], SKIBIDI_RANKS[0][3], SKIBIDI_RANKS[0][4])
     for idx, (name, req, dm, rm, ib) in enumerate(SKIBIDI_RANKS):
         if trophies >= req:
@@ -322,7 +344,7 @@ def apply_card_xp(level: int, xp: float, gained: float) -> Tuple[int, float, int
 
 
 # ==============================================================================
-# 2. БАЗА ДАННЫХ (AIOSQLITE)
+# 2. БАЗА ДАННЫХ (AIOSQLITE) — ЧИСТЫЙ СТАРТ БЕЗ ЮНИТОВ И КРЕЙТОВ
 # ==============================================================================
 
 class Database:
@@ -332,12 +354,12 @@ class Database:
     async def init(self) -> None:
         async with aiosqlite.connect(self.path) as conn:
             await conn.executescript(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     username TEXT DEFAULT '',
                     full_name TEXT DEFAULT 'Игрок',
-                    coins INTEGER DEFAULT 400,
+                    coins INTEGER DEFAULT {INITIAL_COINS},
                     trophies INTEGER DEFAULT 0,
                     p_common INTEGER DEFAULT 2,
                     p_upgraded INTEGER DEFAULT 0,
@@ -359,10 +381,33 @@ class Database:
                     mod_player_crit INTEGER DEFAULT 0
                 );
 
+                CREATE TABLE IF NOT EXISTS rarities (
+                    key TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    emoji TEXT DEFAULT '⚪️',
+                    weight INTEGER DEFAULT 1,
+                    infect_chance REAL DEFAULT 1.0,
+                    has_serial INTEGER DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS child_bots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_id INTEGER NOT NULL,
+                    token TEXT NOT NULL UNIQUE,
+                    bot_id INTEGER DEFAULT 0,
+                    username TEXT DEFAULT '',
+                    title TEXT DEFAULT '',
+                    is_active INTEGER DEFAULT 1,
+                    is_banned INTEGER DEFAULT 0,
+                    updates_count INTEGER DEFAULT 0,
+                    last_error TEXT DEFAULT '',
+                    created_at INTEGER DEFAULT 0
+                );
+
                 CREATE TABLE IF NOT EXISTS admins (
                     user_id INTEGER PRIMARY KEY,
                     added_by INTEGER DEFAULT 0,
-                    perms_json TEXT DEFAULT '{}',
+                    perms_json TEXT DEFAULT '{{}}',
                     added_at INTEGER DEFAULT 0
                 );
 
@@ -431,7 +476,7 @@ class Database:
                     description TEXT DEFAULT '',
                     currency_id INTEGER DEFAULT 0,
                     price INTEGER NOT NULL,
-                    cards_json TEXT DEFAULT '{}',
+                    cards_json TEXT DEFAULT '{{}}',
                     photo_id TEXT DEFAULT '',
                     active INTEGER DEFAULT 1
                 );
@@ -474,14 +519,22 @@ class Database:
                 );
                 """
             )
-            # Синхронизируем таблицу открытых карт из уже существующего инвентаря
             await conn.execute("INSERT OR IGNORE INTO user_discovered (user_id, card_id) SELECT DISTINCT user_id, card_id FROM inventory")
             for k, v in DEFAULT_SETTINGS.items():
                 await conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
+
+            # Сидим только базовые редкости (если таблица пуста). Карт и крейтов изначально 0!
+            r_cnt = (await (await conn.execute("SELECT COUNT(*) FROM rarities")).fetchone())[0]
+            if r_cnt == 0:
+                for rk, rn, re_, rw, rich, rser in DEFAULT_RARITIES:
+                    await conn.execute(
+                        "INSERT OR IGNORE INTO rarities (key, name, emoji, weight, infect_chance, has_serial) VALUES (?, ?, ?, ?, ?, ?)",
+                        (rk, rn, re_, rw, rich, rser),
+                    )
             await conn.commit()
 
         await self.reload_settings()
-        await self.seed_defaults()
+        await self.reload_rarities()
 
     async def reload_settings(self) -> None:
         async with aiosqlite.connect(self.path) as conn:
@@ -494,61 +547,97 @@ class Database:
             await conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
             await conn.commit()
 
-    async def seed_defaults(self) -> None:
-        async with aiosqlite.connect(self.path) as conn:
-            c_cnt = (await (await conn.execute("SELECT COUNT(*) FROM cards")).fetchone())[0]
-            if c_cnt == 0:
-                cards = [
-                    ("Скибиди-Пехотинец", "skibidi", "common", "Single", 115, 24, 1.0, 1.0, 1, "Стартовый боец Скибиди."),
-                    ("Скибиди-Охранник", "skibidi", "common", "Splash", 130, 20, 1.0, 1.0, 1, "Крепкий передовой туалет."),
-                    ("Камерамен-Рекрут", "alliance", "common", "Single", 110, 22, 1.0, 1.0, 0, "Базовый агент Альянса."),
-                    ("Спикермен-Боец", "alliance", "common", "Splash", 105, 21, 1.0, 1.0, 0, "Звуковые волны по площади."),
-                    ("Скибиди-Снайпер", "skibidi", "uncommon", "Single", 150, 38, 1.0, 1.0, 1, "Меткий стрелок с лазером."),
-                    ("Камерамен-Штурмовик", "alliance", "uncommon", "Single", 155, 34, 1.0, 1.0, 0, "Усиленный агент с винтовкой."),
-                    ("Медик-Камерамен", "alliance", "uncommon", "Healer", 145, 32, 1.0, 1.0, 0, "Подлечивает отряд Альянса."),
-                    ("Скибиди-Пироман", "skibidi", "rare", "Fire", 210, 46, 1.0, 1.0, 1, "Поджигает цели огнемётом."),
-                    ("ТВ-Мен Агент", "alliance", "rare", "AOE", 200, 38, 1.0, 1.0, 0, "Фиолетовый экран бьёт всех."),
-                    ("Большой Спикермен", "alliance", "rare", "Splash", 250, 44, 1.0, 1.0, 0, "Мощный звуковой удар."),
-                    ("Скибиди-Учёный", "skibidi", "epic", "Booster", 260, 30, 1.22, 1.18, 1, "Усиливает ATK и HP всей колоды."),
-                    ("Вантузмен", "alliance", "epic", "Single", 290, 78, 1.0, 1.0, 0, "Бесстрашный герой с вантузами."),
-                    ("Тёмный Спикермен", "alliance", "epic", "Fire", 280, 68, 1.0, 1.0, 0, "Атакует кинжалами и огнём."),
-                    ("Скибиди-Мутант Берсерк", "skibidi", "legendary", "Splash", 440, 105, 1.0, 1.0, 1, "Яростный мутант с пилами."),
-                    ("ТВ-Вумен", "alliance", "legendary", "Healer", 400, 95, 1.0, 1.0, 0, "Элитный хилер Альянса."),
-                    ("Камера-Вумен", "alliance", "legendary", "Single", 420, 118, 1.0, 1.0, 0, "Смертоносная пушка на спине."),
-                    ("G-Тойлет 4.0", "skibidi", "mythic", "AOE", 680, 140, 1.0, 1.0, 1, "Лидер Скибиди с 4 лазерами."),
-                    ("Титан Спикермен", "alliance", "mythic", "AOE", 660, 138, 1.0, 1.0, 0, "Могучий звуковой титан."),
-                    ("Титан Камерамен", "alliance", "mythic", "Splash", 760, 152, 1.0, 1.0, 0, "Бронированный титан с молотом."),
-                    ("Астро-Джаггернаут", "astro", "secret", "Fire", 1150, 235, 1.0, 1.0, 1, "Секретный Астро-Скибиди воин."),
-                    ("Титан ТВ-Мен (Улучш.)", "alliance", "secret", "AOE", 1100, 225, 1.0, 1.0, 0, "Легендарный титан с клинком!"),
-                ]
-                for c in cards:
-                    await conn.execute(
-                        "INSERT INTO cards (name, faction, rarity, class_type, hp, atk, booster_dmg_mult, booster_hp_mult, hide_from_ai, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        c,
-                    )
-                await conn.commit()
+    # -------------------- Редкости --------------------
 
-            cr_cnt = (await (await conn.execute("SELECT COUNT(*) FROM crates")).fetchone())[0]
-            if cr_cnt == 0:
-                rows = await (await conn.execute("SELECT id, rarity FROM cards WHERE faction IN ('skibidi', 'astro')")).fetchall()
-                w1, w2 = {}, {}
-                m1 = {"common": 55, "uncommon": 25, "rare": 12, "epic": 5, "legendary": 2, "mythic": 1, "secret": 0}
-                m2 = {"common": 5, "uncommon": 15, "rare": 28, "epic": 26, "legendary": 16, "mythic": 7, "secret": 3}
-                for cid, rar in rows:
-                    if m1.get(rar, 0) > 0:
-                        w1[str(cid)] = m1[rar]
-                    if m2.get(rar, 0) > 0:
-                        w2[str(cid)] = m2[rar]
-                if w1:
-                    await conn.execute(
-                        "INSERT INTO crates (name, description, currency_id, price, cards_json, active) VALUES (?, ?, 0, ?, ?, 1)",
-                        ("📦 Скибиди-Кейс", "Базовый набор бойцов Скибиди.", 200, json.dumps(w1)),
-                    )
-                    await conn.execute(
-                        "INSERT INTO crates (name, description, currency_id, price, cards_json, active) VALUES (?, ?, 0, ?, ?, 1)",
-                        ("💎 Элитный G-Кейс", "Высокий шанс на Эпиков, Легенд, Мификов и Секретки!", 750, json.dumps(w2)),
-                    )
-                    await conn.commit()
+    async def reload_rarities(self) -> None:
+        RARITIES_CACHE.clear()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            rows = await (await conn.execute("SELECT * FROM rarities ORDER BY weight ASC, name ASC")).fetchall()
+            for r in rows:
+                RARITIES_CACHE[r["key"]] = dict(r)
+
+    async def create_rarity(self, key: str, name: str, emoji: str, weight: int, infect_chance: float, has_serial: int) -> None:
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                "INSERT INTO rarities (key, name, emoji, weight, infect_chance, has_serial) VALUES (?, ?, ?, ?, ?, ?)",
+                (key, name, emoji, weight, infect_chance, has_serial),
+            )
+            await conn.commit()
+        await self.reload_rarities()
+
+    async def update_rarity(self, key: str, **kw: Any) -> None:
+        if not kw:
+            return
+        cols = ", ".join(f"{k} = ?" for k in kw)
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(f"UPDATE rarities SET {cols} WHERE key = ?", [*kw.values(), key])
+            await conn.commit()
+        await self.reload_rarities()
+
+    async def delete_rarity(self, key: str) -> None:
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute("DELETE FROM rarities WHERE key = ?", (key,))
+            await conn.commit()
+        await self.reload_rarities()
+
+    # -------------------- Дочерние боты --------------------
+
+    async def list_child_bots(self, owner_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            if owner_id is not None:
+                rows = await (await conn.execute(
+                    "SELECT cb.*, u.username AS owner_username, u.full_name AS owner_name FROM child_bots cb LEFT JOIN users u ON cb.owner_id = u.user_id WHERE cb.owner_id = ? ORDER BY cb.id ASC",
+                    (owner_id,),
+                )).fetchall()
+            else:
+                rows = await (await conn.execute(
+                    "SELECT cb.*, u.username AS owner_username, u.full_name AS owner_name FROM child_bots cb LEFT JOIN users u ON cb.owner_id = u.user_id ORDER BY cb.id DESC"
+                )).fetchall()
+            return [dict(r) for r in rows]
+
+    async def get_child_bot(self, cb_id: int) -> Optional[Dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            r = await (await conn.execute(
+                "SELECT cb.*, u.username AS owner_username, u.full_name AS owner_name FROM child_bots cb LEFT JOIN users u ON cb.owner_id = u.user_id WHERE cb.id = ?",
+                (cb_id,),
+            )).fetchone()
+            return dict(r) if r else None
+
+    async def get_child_bot_by_token(self, token: str) -> Optional[Dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            r = await (await conn.execute("SELECT * FROM child_bots WHERE token = ?", (token,))).fetchone()
+            return dict(r) if r else None
+
+    async def create_child_bot(self, owner_id: int, token: str, bot_id: int, username: str, title: str) -> int:
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "INSERT INTO child_bots (owner_id, token, bot_id, username, title, is_active, is_banned, updates_count, last_error, created_at) VALUES (?, ?, ?, ?, ?, 1, 0, 0, '', ?)",
+                (owner_id, token, bot_id, username, title, int(time.time())),
+            )
+            await conn.commit()
+            return cur.lastrowid
+
+    async def update_child_bot(self, cb_id: int, **kw: Any) -> None:
+        if not kw:
+            return
+        cols = ", ".join(f"{k} = ?" for k in kw)
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(f"UPDATE child_bots SET {cols} WHERE id = ?", [*kw.values(), cb_id])
+            await conn.commit()
+
+    async def inc_child_bot_updates(self, cb_id: int, delta: int = 1) -> None:
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute("UPDATE child_bots SET updates_count = updates_count + ? WHERE id = ?", (delta, cb_id))
+            await conn.commit()
+
+    async def delete_child_bot(self, cb_id: int) -> None:
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute("DELETE FROM child_bots WHERE id = ?", (cb_id,))
+            await conn.commit()
 
     # -------------------- Пользователи --------------------
 
@@ -562,14 +651,10 @@ class Database:
             if not row:
                 is_new = True
                 now = int(time.time())
-                await conn.execute("INSERT INTO users (user_id, username, full_name, created_at) VALUES (?, ?, ?, ?)", (uid, uname, fname, now))
-                starters = await (await conn.execute("SELECT id FROM cards WHERE faction = 'skibidi' AND rarity IN ('common', 'uncommon') ORDER BY id ASC LIMIT 3")).fetchall()
-                for idx, st in enumerate(starters, 1):
-                    await conn.execute(
-                        "INSERT INTO inventory (user_id, card_id, level, xp, is_shiny, is_infected, serial_number, equip_slot, acquired_at) VALUES (?, ?, 1, 0, 0, 0, 0, ?, ?)",
-                        (uid, st["id"], idx, now),
-                    )
-                    await conn.execute("INSERT OR IGNORE INTO user_discovered (user_id, card_id) VALUES (?, ?)", (uid, st["id"]))
+                await conn.execute(
+                    "INSERT INTO users (user_id, username, full_name, coins, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (uid, uname, fname, INITIAL_COINS, now),
+                )
                 await conn.commit()
                 row = await (await conn.execute("SELECT * FROM users WHERE user_id = ?", (uid,))).fetchone()
             elif row["username"] != uname or row["full_name"] != fname:
@@ -810,7 +895,7 @@ class Database:
             await conn.commit()
 
     async def get_card_exist_stats(self, cid: int) -> Tuple[int, int, int]:
-        """Возвращает (всего существует, ✨ Shiny, 🦠 Инфектед) у игроков (без владельца)."""
+        """Возвращает (Exist всего, ✨ Shiny, 🦠 Infected) у игроков (без владельца)."""
         async with aiosqlite.connect(self.path) as conn:
             r = await (await conn.execute(
                 "SELECT COUNT(*), COALESCE(SUM(is_shiny), 0), COALESCE(SUM(is_infected), 0) FROM inventory WHERE card_id = ? AND user_id != ?",
@@ -831,12 +916,12 @@ class Database:
     async def give_card(
         self, uid: int, card_id: int, is_shiny: int = 0, is_infected: int = 0, sign_type: str = "none", signed_by: str = ""
     ) -> Tuple[int, int]:
-        """Выдаёт карту, отмечает в Индексе и назначает серийник [#0001] для Mythic/Secret (обычные/Shiny раздельно)."""
+        """Выдаёт карту, отмечает в Индексе и назначает серийник [#0001] для редкостей с has_serial=1."""
         card = await self.get_card(card_id)
-        rarity = card["rarity"] if card else "common"
+        rar_info = get_rarity(card["rarity"]) if card else get_rarity("common")
         async with aiosqlite.connect(self.path) as conn:
             serial = 0
-            if rarity in SERIAL_RARITIES:
+            if rar_info.get("has_serial"):
                 row = await (await conn.execute(
                     "SELECT COALESCE(MAX(serial_number), 0) FROM inventory WHERE card_id = ? AND is_shiny = ?",
                     (card_id, is_shiny),
@@ -1075,9 +1160,11 @@ class Database:
             return {
                 "users": (await (await conn.execute("SELECT COUNT(*) FROM users")).fetchone())[0],
                 "cards": (await (await conn.execute("SELECT COUNT(*) FROM cards")).fetchone())[0],
+                "rarities": (await (await conn.execute("SELECT COUNT(*) FROM rarities")).fetchone())[0],
                 "crates": (await (await conn.execute("SELECT COUNT(*) FROM crates")).fetchone())[0],
                 "currencies": (await (await conn.execute("SELECT COUNT(*) FROM currencies")).fetchone())[0],
                 "market": (await (await conn.execute("SELECT COUNT(*) FROM market")).fetchone())[0],
+                "child_bots": (await (await conn.execute("SELECT COUNT(*) FROM child_bots")).fetchone())[0],
             }
 
 
@@ -1085,7 +1172,133 @@ db = Database(DB_PATH)
 
 
 # ==============================================================================
-# 3. СТАТЫ КАРТ, 4×4 БОЕВОЙ ДВИЖОК И UI-ХЕЛПЕРЫ
+# 3. МЕНЕДЖЕР ДОЧЕРНИХ БОТОВ (ДИНАМИЧЕСКИЙ POLLING ЧЕРЕЗ feed_update)
+# ==============================================================================
+
+BOT_COMMANDS_LIST = [
+    BotCommand(command="start", description="Главное меню / Показать кнопки"),
+    BotCommand(command="linkbot", description="Привязать своего бота (макс. 2)"),
+]
+
+
+class ChildBotManager:
+    """Управляет запуском, остановкой и мониторингом дочерних ботов в реальном времени."""
+
+    def __init__(self) -> None:
+        self.tasks: Dict[int, asyncio.Task] = {}
+        self.bots: Dict[int, Bot] = {}
+
+    def is_running(self, cb_id: int) -> bool:
+        t = self.tasks.get(cb_id)
+        return bool(t and not t.done())
+
+    async def start_bot(self, cb_row: Dict[str, Any]) -> Tuple[bool, str]:
+        cb_id = cb_row["id"]
+        if self.is_running(cb_id):
+            return True, "Бот уже запущен."
+        if cb_row.get("is_banned"):
+            return False, "Бот заблокирован администрацией."
+        if not MAIN_DP:
+            return False, "Диспетчер не инициализирован."
+
+        bot = Bot(token=cb_row["token"], default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        try:
+            me = await bot.get_me()
+            await bot.set_my_commands(BOT_COMMANDS_LIST)
+            await bot.delete_webhook(drop_pending_updates=True)
+            await db.update_child_bot(cb_id, bot_id=me.id, username=me.username or "", title=me.full_name or "", is_active=1, last_error="")
+        except Exception as exc:
+            await bot.session.close()
+            err = str(exc)[:180]
+            await db.update_child_bot(cb_id, is_active=0, last_error=err)
+            return False, f"Ошибка запуска: {err}"
+
+        self.bots[cb_id] = bot
+        self.tasks[cb_id] = asyncio.create_task(self._poll_loop(cb_id, bot, cb_row["owner_id"]))
+        logger.info("🤖 Дочерний бот #%s (@%s) запущен!", cb_id, me.username)
+        return True, f"Бот @{me.username} запущен!"
+
+    async def stop_bot(self, cb_id: int, mark_db_inactive: bool = True) -> None:
+        task = self.tasks.pop(cb_id, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        bot = self.bots.pop(cb_id, None)
+        if bot:
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
+        if mark_db_inactive:
+            await db.update_child_bot(cb_id, is_active=0)
+
+    async def start_all_active(self) -> int:
+        started = 0
+        for row in await db.list_child_bots():
+            if row["is_active"] and not row["is_banned"]:
+                ok, _ = await self.start_bot(row)
+                if ok:
+                    started += 1
+        return started
+
+    async def stop_all(self, mark_db_inactive: bool = False) -> None:
+        for cb_id in list(self.tasks.keys()):
+            await self.stop_bot(cb_id, mark_db_inactive=mark_db_inactive)
+
+    async def _safe_feed(self, bot: Bot, update: Any) -> None:
+        try:
+            if MAIN_DP:
+                await MAIN_DP.feed_update(bot, update)
+        except Exception as exc:
+            logger.exception("Child bot update error: %s", exc)
+
+    async def _poll_loop(self, cb_id: int, bot: Bot, owner_id: int) -> None:
+        offset = 0
+        allowed = MAIN_DP.resolve_used_update_types() if MAIN_DP else ["message", "callback_query"]
+        try:
+            while True:
+                try:
+                    updates = await bot.get_updates(offset=offset, timeout=25, allowed_updates=allowed)
+                    if updates:
+                        await db.inc_child_bot_updates(cb_id, len(updates))
+                    for upd in updates:
+                        offset = upd.update_id + 1
+                        asyncio.create_task(self._safe_feed(bot, upd))
+                except TelegramUnauthorizedError:
+                    await db.update_child_bot(cb_id, is_active=0, last_error="Токен отозван или недействителен")
+                    if MAIN_BOT:
+                        try:
+                            await MAIN_BOT.send_message(owner_id, f"⚠️ Ваш дочерний бот #{cb_id} остановлен: токен стал недействительным.")
+                        except Exception:
+                            pass
+                    break
+                except TelegramConflictError:
+                    await db.update_child_bot(cb_id, last_error="Конфликт polling (бот запущен где-то ещё)")
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    await db.update_child_bot(cb_id, last_error=str(exc)[:180])
+                    await asyncio.sleep(3)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.tasks.pop(cb_id, None)
+            self.bots.pop(cb_id, None)
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
+
+
+child_manager = ChildBotManager()
+
+
+# ==============================================================================
+# 4. СТАТЫ КАРТ, 4×4 БОЕВОЙ ДВИЖОК И UI-ХЕЛПЕРЫ
 # ==============================================================================
 
 def esc(v: Any) -> str:
@@ -1128,9 +1341,9 @@ def fmt_serial(item: Dict[str, Any]) -> str:
     return f" <b>[#{sn:04d}]</b>" if sn > 0 else ""
 
 
-def fmt_rarity_badge(rarity: str) -> str:
-    r_name, r_ico, _, _ = RARITIES.get(rarity, ("Обычная", "⚪️", 1, 1.0))
-    return f"{r_ico} <b>{r_name.upper()}</b> {r_ico}"
+def fmt_rarity_badge(rarity_key: str) -> str:
+    r = get_rarity(rarity_key)
+    return f"{r['emoji']} <b>{esc(r['name'].upper())}</b> {r['emoji']}"
 
 
 def get_sign_text(item: Dict[str, Any]) -> str:
@@ -1138,19 +1351,12 @@ def get_sign_text(item: Dict[str, Any]) -> str:
     if st == "none":
         return "Нет"
     pct = cfg_int("admin_sign_pct") if st == "admin" else cfg_int("partner_sign_pct")
-    role = "👑 Админ-сигна" if st == "admin" else "🤝 Партнёр-сигна"
+    role = "👑 Admin Sign" if st == "admin" else "🤝 Partner Sign"
     who = f" ({esc(item.get('signed_by'))})" if item.get("signed_by") else ""
     return f"{role} (+{pct}% ATK/HP){who}"
 
 
 def calc_card_stats(item: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Считает боевые статы карты:
-    - Уровень (1..50): +0.5% к урону за каждый уровень свыше 1
-    - ✨ Shiny: +25% к ATK и HP
-    - 🦠 Инфектед: x1.20 к ATK и HP
-    - Сигны: Админ (+10% ATK/HP), Партнёр (+5% ATK/HP)
-    """
     lvl = max(1, min(MAX_CARD_LEVEL, int(item.get("level", 1))))
     lvl_dmg = 1.0 + ((lvl - 1) * DMG_PCT_PER_LEVEL / 100.0)
     sh_mult = (1.0 + cfg_float("shiny_bonus_pct") / 100.0) if item.get("is_shiny") else 1.0
@@ -1178,7 +1384,7 @@ def calc_card_stats(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def format_card_info(item: Dict[str, Any], ex_tot: int = 0, ex_sh: int = 0, ex_inf: int = 0) -> str:
-    _, r_ico, _, base_inf = RARITIES.get(item["rarity"], ("Обычная", "⚪️", 1, 1.0))
+    r = get_rarity(item["rarity"])
     f_name = FACTIONS.get(item["faction"], item["faction"])
     cls = item["class_type"]
     c_ico, c_desc = CARD_CLASSES.get(cls, ("🎯", ""))
@@ -1188,9 +1394,9 @@ def format_card_info(item: Dict[str, Any], ex_tot: int = 0, ex_sh: int = 0, ex_i
     need = xp_needed(lvl)
 
     xp_txt = (
-        f"⭐ Ур. <b>{lvl}/{MAX_CARD_LEVEL}</b> (MAX | <b>+{st['lvl_pct']}%</b> урон)"
+        f"⭐ Lvl <b>{lvl}/{MAX_CARD_LEVEL}</b> (MAX | <b>+{st['lvl_pct']}%</b> ATK)"
         if lvl >= MAX_CARD_LEVEL
-        else f"⭐ Ур. <b>{lvl}/{MAX_CARD_LEVEL}</b> (<b>+{st['lvl_pct']}%</b> урон)\n   {make_bar(xp, need, 8)} {xp:.1f}/{need:.0f} XP"
+        else f"⭐ Lvl <b>{lvl}/{MAX_CARD_LEVEL}</b> (<b>+{st['lvl_pct']}%</b> ATK)\n   {make_bar(xp, need, 8)} {xp:.1f}/{need:.0f} XP"
     )
     status = (
         "🏷 На P2P-рынке"
@@ -1199,7 +1405,7 @@ def format_card_info(item: Dict[str, Any], ex_tot: int = 0, ex_sh: int = 0, ex_i
     )
 
     lines = [
-        f"{r_ico} {c_ico} <b>{esc(item['name'])}</b>{fmt_serial(item)} {card_badges(item)}",
+        f"{r['emoji']} {c_ico} <b>{esc(item['name'])}</b>{fmt_serial(item)} {card_badges(item)}",
         f"Фракция: {f_name} | {fmt_rarity_badge(item['rarity'])}",
         f"Класс: <b>{cls}</b> — <i>{c_desc}</i>",
         f"Статус: {status}",
@@ -1210,21 +1416,21 @@ def format_card_info(item: Dict[str, Any], ex_tot: int = 0, ex_sh: int = 0, ex_i
         "⚔️ <b>ХАРАКТЕРИСТИКИ:</b>",
     ]
     if cls == "Booster":
-        lines.append(f"• ❤️ HP: <b>{st['hp']}</b> | ✨ Бафф: ATK <b>x{st['b_dmg']}</b>, HP <b>x{st['b_hp']}</b>")
+        lines.append(f"• ❤️ HP: <b>{st['hp']}</b> | ✨ Buff: ATK <b>x{st['b_dmg']}</b>, HP <b>x{st['b_hp']}</b>")
     elif cls == "Healer":
-        lines.append(f"• 💗 Хил: <b>{st['atk']}</b> | ❤️ HP: <b>{st['hp']}</b>")
+        lines.append(f"• 💗 Heal: <b>{st['atk']}</b> | ❤️ HP: <b>{st['hp']}</b>")
     else:
-        lines.append(f"• ⚔️ Урон: <b>{st['atk']}</b> | ❤️ HP: <b>{st['hp']}</b> | ⚡ Мощь: <b>{st['power']}</b>")
+        lines.append(f"• ⚔️ ATK: <b>{st['atk']}</b> | ❤️ HP: <b>{st['hp']}</b> | ⚡ Power: <b>{st['power']}</b>")
 
-    sh_t = f"✨ Shiny (+{cfg_int('shiny_bonus_pct')}%)" if item.get("is_shiny") else "Обычная"
-    inf_t = f"🦠 Инфектед (x{cfg_float('infected_mult')})" if item.get("is_infected") else "Нет"
+    sh_t = f"✨ Shiny (+{cfg_int('shiny_bonus_pct')}%)" if item.get("is_shiny") else "Normal"
+    inf_t = f"🦠 Infected (x{cfg_float('infected_mult')})" if item.get("is_infected") else "None"
     lines.extend([
         "",
         "✨ <b>МОДИФИКАТОРЫ:</b>",
         f"• Мутация: <b>{sh_t}</b> | Заражение: <b>{inf_t}</b>",
         f"• Сигна: {get_sign_text(item)}",
-        f"• 🌍 Существует: <b>{ex_tot}</b> шт. (✨ Shiny: <b>{ex_sh}</b> | 🦠 Инф: <b>{ex_inf}</b>)",
-        f"• 🦠 Базовый шанс заразить: <b>{fmt_pct(base_inf)}%</b>",
+        f"• 🌍 Exist: <b>{ex_tot}</b> (✨ Shiny: <b>{ex_sh}</b> | 🦠 Infected: <b>{ex_inf}</b>)",
+        f"• 🦠 Баз. шанс заразить: <b>{fmt_pct(r['infect_chance'])}%</b>",
     ])
     if item.get("description"):
         lines.append(f"\n📝 <i>{esc(item['description'])}</i>")
@@ -1232,31 +1438,37 @@ def format_card_info(item: Dict[str, Any], ex_tot: int = 0, ex_sh: int = 0, ex_i
 
 
 async def generate_enemy_team(rank_idx: int, diff_key: str) -> List[Dict[str, Any]]:
-    """Подбирает отряд Альянса под ранг Скибиди-игрока и выбранную сложность."""
+    """Подбирает отряд врагов под ранг игрока и динамический список редкостей."""
     _, d_mult, _, shift, _ = DIFFICULTIES[diff_key]
     r_diff_mult = SKIBIDI_RANKS[rank_idx][2]
 
     all_ai = await db.list_cards(ai_only=True)
     if not all_ai:
         all_ai = await db.list_cards()
+    if not all_ai:
+        return []
+
     by_rar: Dict[str, List[Dict[str, Any]]] = {}
     for c in all_ai:
         by_rar.setdefault(c["rarity"], []).append(c)
 
-    tier = min(6, max(0, (rank_idx // 4) + shift))
-    rar_order = ["common", "uncommon", "rare", "epic", "legendary", "mythic", "secret"]
+    rar_list = sorted_rarities(reverse=False)
+    rar_keys = [r["key"] for r in rar_list] or ["common"]
+    max_t = len(rar_keys) - 1
+    scaled_tier = int((rank_idx / 30.0) * max_t)
+    tier = min(max_t, max(0, scaled_tier + shift))
 
     team = []
     used: Set[int] = set()
     stat_scale = max(0.65, (r_diff_mult ** 0.55) * d_mult)
 
     for _ in range(4):
-        r = random.random()
-        pick_t = tier if r < 0.55 else (max(0, tier - 1) if r < 0.85 else min(6, tier + 1))
-        if pick_t == 6 and diff_key != "crazy" and rank_idx < 24:
-            pick_t = 5
+        rv = random.random()
+        pick_t = tier if rv < 0.55 else (max(0, tier - 1) if rv < 0.85 else min(max_t, tier + 1))
+        if pick_t == max_t and max_t >= 2 and diff_key != "crazy" and rank_idx < 24:
+            pick_t = max_t - 1
 
-        pool = [c for c in by_rar.get(rar_order[pick_t], []) if c["id"] not in used]
+        pool = [c for c in by_rar.get(rar_keys[pick_t], []) if c["id"] not in used]
         if not pool:
             pool = [c for c in all_ai if c["id"] not in used] or all_ai
         chosen = dict(random.choice(pool))
@@ -1322,7 +1534,7 @@ def apply_boosters_team(team: List[Dict[str, Any]], label: str, logs: List[str])
 def fmt_combat_unit(idx: int, u: Dict[str, Any]) -> str:
     if u["hp"] <= 0:
         return f"{idx}. 💀 <s>{esc(u['name'])}</s>"
-    r_ico = RARITIES.get(u["rarity"], ("", "⚪️", 1, 1.0))[1]
+    r_ico = get_rarity(u["rarity"])["emoji"]
     c_ico = CARD_CLASSES.get(u["class_type"], ("🎯", ""))[0]
     b = ("✨" if u.get("is_shiny") else "") + ("🦠" if u.get("is_infected") else "")
     st = " 🔥" if u.get("burn", 0) > 0 else ""
@@ -1345,12 +1557,12 @@ def render_battle_screen(
     p_txt = "\n".join(fmt_combat_unit(i, u) for i, u in enumerate(t1, 1))
     e_txt = "\n".join(fmt_combat_unit(i, u) for i, u in enumerate(t2, 1))
     ev = "\n".join(f"• {l}" for l in logs[-3:]) if logs else "• <i>Бой начинается...</i>"
-    inf_tag = f" | 🦠 Перехвачено: <b>{inf_cnt}</b>" if inf_cnt else ""
+    inf_tag = f" | 🦠 Infected: <b>{inf_cnt}</b>" if inf_cnt else ""
     return (
         f"{title} | <b>Раунд {rnd}</b>{inf_tag}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔵 <b>{esc(p_name)} (Скибиди):</b>\n{p_txt}\n\n"
-        f"🔴 <b>{esc(e_name)} (Альянс):</b>\n{e_txt}\n"
+        f"🔵 <b>{esc(p_name)} (Skibidi):</b>\n{p_txt}\n\n"
+        f"🔴 <b>{esc(e_name)} (Alliance):</b>\n{e_txt}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"⚡ <b>Лог боя:</b>\n{ev}"
     )
@@ -1363,7 +1575,7 @@ def _try_infect_enemy(
     luck_mult: float,
     logs: List[str],
 ) -> None:
-    base_ch = RARITIES.get(enemy["rarity"], ("", "", 1, 1.0))[3]
+    base_ch = float(get_rarity(enemy["rarity"])["infect_chance"])
     total_ch = calc_infect_chance(base_ch, infect_bonus_pct, luck_mult)
     if (random.random() * 100.0) < total_ch:
         infected_drops.append({"card_id": enemy["card_id"], "name": enemy["name"], "rarity": enemy["rarity"], "chance": total_ch})
@@ -1400,7 +1612,7 @@ def perform_combat_turn(
     cls = actor["class_type"]
     is_crit = crit_chance > 0 and random.random() < crit_chance
     base_dmg = max(1, int(actor["atk"] * (1.5 if is_crit else 1.0)))
-    crit_tag = " 💥КРИТ!" if is_crit else ""
+    crit_tag = " 💥CRIT!" if is_crit else ""
 
     def record_dmg(dealt: int) -> None:
         if is_player and actor.get("inv_id"):
@@ -1505,19 +1717,28 @@ async def render_view(
 
 
 def main_reply_kb(is_admin: bool = False) -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton(text="⚔️ В бой (Альянс)"), KeyboardButton(text="🛡 Колода")],
-        [KeyboardButton(text="🎒 Инвентарь"), KeyboardButton(text="📖 Индекс")],
-        [KeyboardButton(text="📦 Крейты и Лаба"), KeyboardButton(text="🌐 Мультиплеер")],
-        [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🏆 Рейтинг")],
-    ]
+    """
+    Точное расположение кнопок 3×3:
+    колода      играть        инвентарь
+    профиль     крейты        индекс
+    лидерборд   админ панель  мультиплеер
+    is_persistent=False позволяет сворачивать меню встроенной кнопкой Telegram + есть кнопка скрытия.
+    """
+    row3 = [KeyboardButton(text="🏆 Лидерборд")]
     if is_admin:
-        rows.append([KeyboardButton(text="⚙️ Админ-панель")])
+        row3.append(KeyboardButton(text="⚙️ Админ-панель"))
+    row3.append(KeyboardButton(text="🌐 Мультиплеер"))
+
+    rows = [
+        [KeyboardButton(text="🛡 Колода"), KeyboardButton(text="⚔️ Играть"), KeyboardButton(text="🎒 Инвентарь")],
+        [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📦 Крейты"), KeyboardButton(text="📖 Индекс")],
+        row3,
+    ]
     return ReplyKeyboardMarkup(
         keyboard=rows,
         resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="Меню Скибиди-Туалетов...",
+        is_persistent=False,
+        input_field_placeholder="Меню Skibidi Verse...",
     )
 
 
@@ -1550,12 +1771,18 @@ class AccessMiddleware(BaseMiddleware):
 
 
 # ==============================================================================
-# 4. FSM СОСТОЯНИЯ
+# 5. FSM СОСТОЯНИЯ
 # ==============================================================================
 
 class PlayerFSM(StatesGroup):
     search = State()
     market_price = State()
+    link_bot_token = State()
+
+
+class RarityFSM(StatesGroup):
+    create = State()
+    edit_val = State()
 
 
 class CardFSM(StatesGroup):
@@ -1597,7 +1824,7 @@ class AdminFSM(StatesGroup):
 
 
 # ==============================================================================
-# 5. ОСНОВНОЙ РОУТЕР: СТАРТ, ПРОФИЛЬ, МОДЫ, КОЛОДА, ИНВЕНТАРЬ И ИНДЕКС (GGTD STYLE)
+# 6. ОСНОВНОЙ РОУТЕР: /start, /linkbot, ПРОФИЛЬ, КОЛОДА, ИНВЕНТАРЬ, ИНДЕКС
 # ==============================================================================
 
 router = Router()
@@ -1607,23 +1834,170 @@ router = Router()
 async def cmd_start(message: Message, state: FSMContext, is_admin: bool):
     await state.clear()
     _, is_new = await db.ensure_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
-    gift = "\n\n🎁 <b>Стартовый набор:</b> 3 Скибиди-бойца в колоде, 400 💰 и 2 🦠 паразита!" if is_new else ""
+    gift = f"\n\n🎁 <b>Стартовый баланс:</b> {INITIAL_COINS} 💰 и 2 🦠 паразита!" if is_new else ""
+    kb_inline = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔽 Скрыть нижнее меню", callback_data="ui:hide_menu")]])
     await message.answer(
         f"🚽 <b>Skibidi Verse: Cards & Infection</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"• Играй за <b>Скибиди-Туалетов</b>, сражайся 4×4 против Альянса и поднимайся по <b>31 рангу</b>!\n"
         f"• При убийстве врага в бою есть шанс его <b>🦠 заразить</b> (чем выше ранг и паразит — тем выше шанс!).\n"
-        f"• Качай карты в боях: <b>1 урон = 0.1 XP</b> (до 50 ур., +0.5% урона за ур.).\n"
-        f"• Лови <b>✨ Shiny</b> и серийные номера <b>[#0001]</b> на Mythic/Secret!{gift}\n\n"
-        f"👇 Выбирай раздел в меню снизу.",
+        f"• Качай карты в боях: <b>1 урон = 0.1 XP</b> (до 50 ур., +0.5% ATK за уровень).\n"
+        f"• Привяжи своего дочернего бота через /linkbot (до {MAX_CHILD_BOTS_PER_USER} шт.).{gift}\n\n"
+        f"👇 Используй меню снизу (можно свернуть кнопкой Telegram или скрыть кнопкой ниже).",
         reply_markup=main_reply_kb(is_admin),
     )
+    await message.answer("⚙️ <i>Управление видимостью меню (вернуть меню — /start):</i>", reply_markup=kb_inline)
 
 
-@router.message(Command("panel"))
-async def cmd_panel(message: Message, state: FSMContext, is_admin: bool):
+@router.callback_query(F.data == "ui:hide_menu")
+async def cb_hide_menu(cb: CallbackQuery):
+    await cb.message.answer("🔽 Нижнее меню скрыто. Чтобы вернуть его обратно — нажмите /start.", reply_markup=ReplyKeyboardRemove())
+    await cb.answer("Меню скрыто!")
+
+
+# -------------------- ДОЧЕРНИЕ БОТЫ (/linkbot ДЛЯ ИГРОКОВ) --------------------
+
+async def render_user_linkbot(target: Message | CallbackQuery, uid: int):
+    my_bots = await db.list_child_bots(owner_id=uid)
+    allow = GAME_SETTINGS.get("allow_child_bots", "1") == "1"
+    lines = [
+        f"🤖 <b>МОИ ДОЧЕРНИЕ БОТЫ ({len(my_bots)}/{MAX_CHILD_BOTS_PER_USER})</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        "Вы можете привязать до <b>2</b> собственных ботов из @BotFather — они будут работать на той же базе данных и с тем же прогрессом!\n",
+    ]
+    rows: List[List[InlineKeyboardButton]] = []
+    if not my_bots:
+        lines.append("<i>У вас пока нет привязанных ботов.</i>")
+    else:
+        for b in my_bots:
+            if b["is_banned"]:
+                st = "🚫 Заблокирован"
+            elif child_manager.is_running(b["id"]):
+                st = "🟢 Работает"
+            else:
+                st = "🔴 Остановлен"
+            uname = f"@{esc(b['username'])}" if b["username"] else f"Bot #{b['id']}"
+            err = f"\n   └ ⚠️ <i>{esc(b['last_error'])}</i>" if b.get("last_error") else ""
+            lines.append(f"• {uname} — {st} | Запросов: <b>{b['updates_count']}</b>{err}")
+            btn_row = []
+            if not b["is_banned"]:
+                if child_manager.is_running(b["id"]):
+                    btn_row.append(InlineKeyboardButton(text=f"⏹ Стоп {b['username'] or b['id']}", callback_data=f"lb:stop:{b['id']}"))
+                else:
+                    btn_row.append(InlineKeyboardButton(text=f"▶️ Старт {b['username'] or b['id']}", callback_data=f"lb:start:{b['id']}"))
+            btn_row.append(InlineKeyboardButton(text="🗑 Отвязать", callback_data=f"lb:del:{b['id']}"))
+            rows.append(btn_row)
+
+    if len(my_bots) < MAX_CHILD_BOTS_PER_USER and allow:
+        rows.append([InlineKeyboardButton(text="➕ Привязать нового бота", callback_data="lb:add")])
+    elif not allow:
+        lines.append("\n🔒 <i>Привязка новых ботов временно отключена администрацией.</i>")
+
+    await render_view(target, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
+
+
+@router.message(Command("linkbot"))
+async def cmd_linkbot(m: Message, state: FSMContext):
     await state.clear()
-    await message.answer("🚽 <b>Меню Skibidi Verse</b>", reply_markup=main_reply_kb(is_admin))
+    await render_user_linkbot(m, m.from_user.id)
+
+
+@router.callback_query(F.data == "lb:add")
+async def cb_lb_add(cb: CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    if GAME_SETTINGS.get("allow_child_bots", "1") != "1":
+        await cb.answer("Привязка новых ботов отключена!", show_alert=True)
+        return
+    if len(await db.list_child_bots(owner_id=uid)) >= MAX_CHILD_BOTS_PER_USER:
+        await cb.answer(f"Максимум {MAX_CHILD_BOTS_PER_USER} бота!", show_alert=True)
+        return
+    await state.set_state(PlayerFSM.link_bot_token)
+    await cb.message.answer(
+        "🔑 Отправьте <b>API-токен</b> вашего бота от @BotFather.\n"
+        "<i>Пример: <code>1234567890:AAF_...</code> (сообщение с токеном лучше удалить после привязки, бот сам сотрёт его, если сможет).</i>"
+    )
+    await cb.answer()
+
+
+@router.message(PlayerFSM.link_bot_token)
+async def fsm_lb_token(m: Message, state: FSMContext):
+    token = (m.text or "").strip()
+    uid = m.from_user.id
+    await state.clear()
+    try:
+        await m.delete()
+    except Exception:
+        pass
+
+    if len(await db.list_child_bots(owner_id=uid)) >= MAX_CHILD_BOTS_PER_USER:
+        await m.answer(f"❌ Достигнут лимит: максимум {MAX_CHILD_BOTS_PER_USER} бота.")
+        return
+    if not re.match(r"^\d{5,}:[A-Za-z0-9_-]{20,}$", token):
+        await m.answer("❌ Некорректный формат токена! Получите токен в @BotFather и попробуйте снова через /linkbot.")
+        return
+    if token == BOT_TOKEN or await db.get_child_bot_by_token(token):
+        await m.answer("❌ Этот бот уже привязан в системе!")
+        return
+
+    wait_msg = await m.answer("⏳ Проверяю токен и запускаю дочернего бота...")
+    test_bot = Bot(token=token)
+    try:
+        me = await test_bot.get_me()
+    except Exception as exc:
+        await wait_msg.edit_text(f"❌ Токен не прошёл проверку Telegram: <code>{esc(str(exc)[:150])}</code>")
+        return
+    finally:
+        await test_bot.session.close()
+
+    cb_id = await db.create_child_bot(uid, token, me.id, me.username or "", me.full_name or "")
+    row = await db.get_child_bot(cb_id)
+    ok, msg_txt = await child_manager.start_bot(row)
+    if ok:
+        await wait_msg.edit_text(f"✅ Дочерний бот <b>@{esc(me.username)}</b> успешно привязан и запущен! Напишите ему /start.")
+        if MAIN_BOT and uid != OWNER_ID:
+            try:
+                await MAIN_BOT.send_message(OWNER_ID, f"🤖 Новый дочерний бот <b>@{esc(me.username)}</b> привязан игроком <code>{uid}</code>.")
+            except Exception:
+                pass
+    else:
+        await wait_msg.edit_text(f"⚠️ Бот сохранён, но не запустился: {esc(msg_txt)}")
+
+
+@router.callback_query(F.data.startswith("lb:start:"))
+async def cb_lb_start(cb: CallbackQuery):
+    cb_id = int(cb.data.split(":")[2])
+    row = await db.get_child_bot(cb_id)
+    if not row or row["owner_id"] != cb.from_user.id:
+        await cb.answer("Бот не найден.", show_alert=True)
+        return
+    ok, msg_txt = await child_manager.start_bot(row)
+    await cb.answer(msg_txt, show_alert=not ok)
+    await render_user_linkbot(cb, cb.from_user.id)
+
+
+@router.callback_query(F.data.startswith("lb:stop:"))
+async def cb_lb_stop(cb: CallbackQuery):
+    cb_id = int(cb.data.split(":")[2])
+    row = await db.get_child_bot(cb_id)
+    if not row or row["owner_id"] != cb.from_user.id:
+        await cb.answer("Бот не найден.", show_alert=True)
+        return
+    await child_manager.stop_bot(cb_id, mark_db_inactive=True)
+    await cb.answer("⏹ Бот остановлен.")
+    await render_user_linkbot(cb, cb.from_user.id)
+
+
+@router.callback_query(F.data.startswith("lb:del:"))
+async def cb_lb_del(cb: CallbackQuery):
+    cb_id = int(cb.data.split(":")[2])
+    row = await db.get_child_bot(cb_id)
+    if not row or row["owner_id"] != cb.from_user.id:
+        await cb.answer("Бот не найден.", show_alert=True)
+        return
+    await child_manager.stop_bot(cb_id, mark_db_inactive=False)
+    await db.delete_child_bot(cb_id)
+    await cb.answer("🗑 Бот отвязан!", show_alert=True)
+    await render_user_linkbot(cb, cb.from_user.id)
 
 
 # -------------------- ПРОФИЛЬ И МОДИФИКАТОРЫ --------------------
@@ -1636,7 +2010,7 @@ async def build_profile_text(u: Dict[str, Any], is_self: bool = True) -> str:
     shiny_c = sum(1 for c in inv if c["is_shiny"])
     inf_c = sum(1 for c in inv if c["is_infected"])
     s_role = await db.get_signer_role(u["user_id"])
-    badge = " | 👑 Админ-Сигнер" if s_role == "admin" else (" | 🤝 Партнёр-Сигнер" if s_role == "partner" else "")
+    badge = " | 👑 Admin Signer" if s_role == "admin" else (" | 🤝 Partner Signer" if s_role == "partner" else "")
 
     extra_curs = await db.get_user_currencies(u["user_id"])
     cur_lines = "\n".join(f"   • {esc(c['name'])}: <b>{c['amount']}</b>" for c in extra_curs)
@@ -1645,9 +2019,9 @@ async def build_profile_text(u: Dict[str, Any], is_self: bool = True) -> str:
     l_mult, l_sec, c_mult, c_sec = get_active_events()
     ev_parts = []
     if l_mult > 1.0:
-        ev_parts.append(f"🍀 Удача x{l_mult} ({l_sec // 60}м)")
+        ev_parts.append(f"🍀 Luck x{l_mult} ({l_sec // 60}м)")
     if c_mult > 1.0:
-        ev_parts.append(f"💰 Монеты x{c_mult} ({c_sec // 60}м)")
+        ev_parts.append(f"💰 Coins x{c_mult} ({c_sec // 60}м)")
     ev_line = f"\n🎉 <b>Ивенты:</b> {' | '.join(ev_parts)}" if ev_parts else ""
 
     return (
@@ -1658,8 +2032,8 @@ async def build_profile_text(u: Dict[str, Any], is_self: bool = True) -> str:
         f"   └ Награды: <b>x{r_rew}</b> | Заражение: <b>+{r_inf}%</b> от шанса\n\n"
         f"💰 Монеты: <b>{u['coins']}</b>{cur_block}\n"
         f"🦠 Паразиты: Обыч. <b>{u['p_common']}</b> | Улучш. <b>{u['p_upgraded']}</b> | Элит. <b>{u['p_elite']}</b>\n\n"
-        f"🛡 Колода: <b>{len(eq)}/{MAX_DECK_SIZE}</b> (⚡ Мощь: <b>{power}</b>)\n"
-        f"🃏 Карт: <b>{len(inv)}</b> (✨Shiny: {shiny_c} | 🦠Зар.: {inf_c})\n"
+        f"🛡 Колода: <b>{len(eq)}/{MAX_DECK_SIZE}</b> (⚡ Power: <b>{power}</b>)\n"
+        f"🃏 Карт: <b>{len(inv)}</b> (✨Shiny: {shiny_c} | 🦠Infected: {inf_c})\n"
         f"📊 Бои: <b>{u['wins']}W / {u['losses']}L</b> | 💥 Урон: <b>{int(u['total_damage'])}</b>\n"
         f"🦠 Заражений: <b>{u['infections_success']}</b> | 🎯 Пити: <b>+{u['pity_bonus']}%</b> | 🔥 Входы: <b>{u['daily_streak']} дн.</b>{ev_line}"
     )
@@ -1669,7 +2043,8 @@ def profile_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎁 Ежедневка", callback_data="prof:daily"), InlineKeyboardButton(text="🧬 Моды боя", callback_data="prof:mods")],
-            [InlineKeyboardButton(text="🔎 Найти игрока", callback_data="prof:search"), InlineKeyboardButton(text="🔄 Обновить", callback_data="prof:ref")],
+            [InlineKeyboardButton(text="🔎 Найти игрока", callback_data="prof:search"), InlineKeyboardButton(text="🤖 Мои боты", callback_data="prof:bots")],
+            [InlineKeyboardButton(text="🔽 Скрыть меню", callback_data="ui:hide_menu"), InlineKeyboardButton(text="🔄 Обновить", callback_data="prof:ref")],
         ]
     )
 
@@ -1684,6 +2059,12 @@ async def menu_profile(message: Message, state: FSMContext):
 async def cb_prof_ref(cb: CallbackQuery):
     await render_view(cb, await build_profile_text(await db.get_user(cb.from_user.id), True), profile_kb())
     await cb.answer("Обновлено!")
+
+
+@router.callback_query(F.data == "prof:bots")
+async def cb_prof_bots(cb: CallbackQuery):
+    await render_user_linkbot(cb, cb.from_user.id)
+    await cb.answer()
 
 
 @router.callback_query(F.data == "prof:daily")
@@ -1753,27 +2134,27 @@ async def cb_mod_toggle(cb: CallbackQuery):
     await cb.answer()
 
 
-# -------------------- КОЛОДА (ЭКИПИРОВКА 2.0) --------------------
+# -------------------- КОЛОДА --------------------
 
 async def render_deck(target: Message | CallbackQuery, uid: int):
     inv = await db.get_inventory(uid)
     smap = {c["equip_slot"]: c for c in inv if c["equip_slot"] > 0}
     pwr = sum(calc_card_stats(c)["power"] for c in smap.values())
     nums = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
-    lines = [f"🛡 <b>БОЕВАЯ КОЛОДА ({len(smap)}/{MAX_DECK_SIZE})</b> | ⚡ Мощь: <b>{pwr}</b>", "━━━━━━━━━━━━━━━━━━"]
+    lines = [f"🛡 <b>БОЕВАЯ КОЛОДА ({len(smap)}/{MAX_DECK_SIZE})</b> | ⚡ Power: <b>{pwr}</b>", "━━━━━━━━━━━━━━━━━━"]
     s_btns = []
     for s in range(1, MAX_DECK_SIZE + 1):
         c = smap.get(s)
         if c:
             st = calc_card_stats(c)
-            r_ico = RARITIES.get(c["rarity"], ("", "⚪️", 1, 1.0))[1]
+            r_ico = get_rarity(c["rarity"])["emoji"]
             c_ico = CARD_CLASSES.get(c["class_type"], ("🎯", ""))[0]
             stat = (
                 f"✨x{st['b_dmg']}/x{st['b_hp']}"
                 if c["class_type"] == "Booster"
                 else (f"💗{st['atk']} ❤️{st['hp']}" if c["class_type"] == "Healer" else f"⚔️{st['atk']} ❤️{st['hp']}")
             )
-            lines.append(f"{nums[s - 1]} {r_ico}{c_ico} <b>{esc(c['name'])}</b>{fmt_serial(c)}{card_badges(c)} Ур.{c['level']} [{stat}]")
+            lines.append(f"{nums[s - 1]} {r_ico}{c_ico} <b>{esc(c['name'])}</b>{fmt_serial(c)}{card_badges(c)} Lvl.{c['level']} [{stat}]")
             s_btns.append(InlineKeyboardButton(text=f"{nums[s - 1]} {c['name'][:12]}", callback_data=f"eq:slot:{s}:0"))
         else:
             lines.append(f"{nums[s - 1]} ⬜ <i>[Пустой слот]</i>")
@@ -1791,7 +2172,7 @@ async def render_slot_picker(target: Message | CallbackQuery, uid: int, slot: in
     inv = await db.get_inventory(uid)
     cur = next((c for c in inv if c["equip_slot"] == slot), None)
     avail = [c for c in inv if not c.get("market_id") and c["equip_slot"] == 0]
-    avail.sort(key=lambda x: (RARITIES.get(x["rarity"], ("", "", 0, 0))[2], x["is_shiny"], x["is_infected"], calc_card_stats(x)["power"]), reverse=True)
+    avail.sort(key=lambda x: (get_rarity(x["rarity"])["weight"], x["is_shiny"], x["is_infected"], calc_card_stats(x)["power"]), reverse=True)
     per = 6
     tp = max(1, (len(avail) + per - 1) // per)
     page = max(0, min(page, tp - 1))
@@ -1801,9 +2182,9 @@ async def render_slot_picker(target: Message | CallbackQuery, uid: int, slot: in
     if cur:
         rows.append([InlineKeyboardButton(text="ℹ️ Инфо", callback_data=f"c:v:{cur['inv_id']}:deck:0"), InlineKeyboardButton(text="➖ Освободить", callback_data=f"eq:un:{cur['inv_id']}")])
     for c in avail[page * per : (page + 1) * per]:
-        r_ico = RARITIES.get(c["rarity"], ("", "⚪️", 1, 1.0))[1]
+        r_ico = get_rarity(c["rarity"])["emoji"]
         sn = f" #{c['serial_number']:04d}" if c["serial_number"] else ""
-        rows.append([InlineKeyboardButton(text=f"{r_ico}{card_badges(c)} {c['name']}{sn} (Ур.{c['level']})", callback_data=f"eq:put:{slot}:{c['inv_id']}")])
+        rows.append([InlineKeyboardButton(text=f"{r_ico}{card_badges(c)} {c['name']}{sn} (Lvl.{c['level']})", callback_data=f"eq:put:{slot}:{c['inv_id']}")])
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"eq:slot:{slot}:{page - 1}"))
@@ -1814,7 +2195,7 @@ async def render_slot_picker(target: Message | CallbackQuery, uid: int, slot: in
     await render_view(target, txt, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
-# -------------------- ИНВЕНТАРЬ (В СТИЛЕ GGTD CARDS) --------------------
+# -------------------- ИНВЕНТАРЬ (GGTD STYLE) --------------------
 
 async def render_inventory(target: Message | CallbackQuery, uid: int, flt: str = "all", page: int = 0):
     u = await db.get_user(uid)
@@ -1829,7 +2210,6 @@ async def render_inventory(target: Message | CallbackQuery, uid: int, flt: str =
     else:
         fl = inv
 
-    # Группировка дубликатов (стаки), сохраняя уникальные с серийником, подписью, в колоде или на рынке отдельно
     stacks: List[Tuple[Dict[str, Any], int]] = []
     seen: Dict[Tuple, int] = {}
     for c in fl:
@@ -1844,11 +2224,10 @@ async def render_inventory(target: Message | CallbackQuery, uid: int, flt: str =
             seen[k] = len(stacks)
             stacks.append((c, 1))
 
-    # Сортировка как в GGTD Cards: подписанные -> редкость -> Shiny -> Инфектед -> уровень -> ID
     stacks.sort(
         key=lambda x: (
             1 if x[0]["sign_type"] != "none" else 0,
-            RARITIES.get(x[0]["rarity"], ("", "", 0, 0))[2],
+            get_rarity(x[0]["rarity"])["weight"],
             x[0]["is_shiny"],
             x[0]["is_infected"],
             x[0]["level"],
@@ -1865,7 +2244,7 @@ async def render_inventory(target: Message | CallbackQuery, uid: int, flt: str =
     unique_cnt = len({c["card_id"] for c in inv})
     shiny_cnt = sum(1 for c in inv if c["is_shiny"])
     inf_cnt = sum(1 for c in inv if c["is_infected"])
-    flt_names = {"all": "Все", "sh": "✨ Shiny", "inf": "🦠 Заражённые", "eq": "✅ В колоде"}
+    flt_names = {"all": "Все", "sh": "✨ Shiny", "inf": "🦠 Infected", "eq": "✅ В колоде"}
 
     lines = [
         f"🎒 <b>ИНВЕНТАРЬ КАРТ — {flt_names.get(flt, 'Все')} (Стр. {page + 1}/{tp})</b>",
@@ -1877,26 +2256,26 @@ async def render_inventory(target: Message | CallbackQuery, uid: int, flt: str =
         lines.append("<i>В этом разделе пока пусто.</i>")
     else:
         for idx, (c, qty) in enumerate(chunk, page * per + 1):
-            r_ico = RARITIES.get(c["rarity"], ("", "⚪️", 1, 1.0))[1]
+            r_ico = get_rarity(c["rarity"])["emoji"]
             c_ico = CARD_CLASSES.get(c["class_type"], ("🎯", ""))[0]
             tag = f"✅#{c['equip_slot']} " if c["equip_slot"] > 0 else ("🏷 " if c.get("market_id") else "")
             b = card_badges(c)
             sn = fmt_serial(c)
             sgn_str = f" <i>(✍️ {esc(c['signed_by'])})</i>" if c["sign_type"] != "none" and c.get("signed_by") else ""
-            lines.append(f"{idx}. {tag}{r_ico}{c_ico} <b>{esc(c['name'])}</b>{sn}{b}{sgn_str} [Ур.{c['level']}] — <b>{qty} шт.</b>")
+            lines.append(f"{idx}. {tag}{r_ico}{c_ico} <b>{esc(c['name'])}</b>{sn}{b}{sgn_str} [Lvl.{c['level']}] — <b>{qty} шт.</b>")
 
-    lines.append("\n👇 <i>Нажмите на номер карты ниже, чтобы открыть Инфо, надеть или продать:</i>")
+    lines.append("\n👇 <i>Выберите карту ниже, чтобы открыть Инфо, надеть или продать:</i>")
 
     rows: List[List[InlineKeyboardButton]] = [[
         InlineKeyboardButton(text="• Все •" if flt == "all" else "Все", callback_data="inv:all:0"),
         InlineKeyboardButton(text="• ✨ •" if flt == "sh" else "✨ Shiny", callback_data="inv:sh:0"),
-        InlineKeyboardButton(text="• 🦠 •" if flt == "inf" else "🦠 Зар.", callback_data="inv:inf:0"),
+        InlineKeyboardButton(text="• 🦠 •" if flt == "inf" else "🦠 Inf", callback_data="inv:inf:0"),
         InlineKeyboardButton(text="• ✅ •" if flt == "eq" else "✅ Колода", callback_data="inv:eq:0"),
     ]]
 
     btn_row: List[InlineKeyboardButton] = []
     for idx, (c, _) in enumerate(chunk, page * per + 1):
-        r_ico = RARITIES.get(c["rarity"], ("", "⚪️", 1, 1.0))[1]
+        r_ico = get_rarity(c["rarity"])["emoji"]
         btn_row.append(InlineKeyboardButton(text=f"{idx}. {r_ico} {c['name'][:11]}", callback_data=f"c:v:{c['inv_id']}:{flt}:{page}"))
         if len(btn_row) == 2:
             rows.append(btn_row)
@@ -1912,7 +2291,7 @@ async def render_inventory(target: Message | CallbackQuery, uid: int, flt: str =
         nav.append(InlineKeyboardButton(text="➡️", callback_data=f"inv:{flt}:{page + 1}"))
     rows.append(nav)
     rows.append([
-        InlineKeyboardButton(text="🛡 Экипировка", callback_data="eq:home"),
+        InlineKeyboardButton(text="🛡 Колода", callback_data="eq:home"),
         InlineKeyboardButton(text="📖 Индекс", callback_data="idx:0"),
     ])
     await render_view(target, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
@@ -1948,1995 +2327,23 @@ async def render_card_view(target: Message | CallbackQuery, uid: int, inv_id: in
     await render_view(target, txt, InlineKeyboardMarkup(inline_keyboard=rows), photo=item.get("photo_id") or None)
 
 
-# -------------------- ИНДЕКС КАРТ (В СТИЛЕ GGTD CARDS) --------------------
+# -------------------- ИНДЕКС КАРТ (ДО 8 ЮНИТОВ НА СТРАНИЦУ, EXIST НА АНГЛ) --------------------
 
 async def render_index(target: Message | CallbackQuery, uid: int, page: int = 0):
     all_cards = await db.list_cards()
+    if not all_cards:
+        await render_view(
+            target,
+            "📖 <b>ИНДЕКС КАРТ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n<i>В базе пока нет ни одного юнита. Админ может создать их в Админ-панели!</i>",
+            InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛡 Колода", callback_data="eq:home")]]),
+        )
+        return
+
     discovered = await db.get_discovered_ids(uid)
     u = await db.get_user(uid)
     _, _, _, _, r_inf = get_rank_info(u["trophies"])
     l_mult, _, _, _ = get_active_events()
 
-    # Собираем, из каких крейтов выпадает каждая карта и её реальный шанс в крейте
     crates = await db.list_crates(active_only=True)
     crate_sources: Dict[int, List[str]] = {}
-    for cr in crates:
-        w_map = cr["cards"]
-        tot_w = 0.0
-        eff_w: Dict[int, float] = {}
-        by_id = {c["id"]: c for c in all_cards}
-        for k, v in w_map.items():
-            cid = int(k)
-            if cid in by_id and float(v) > 0:
-                fw = float(v) * (l_mult if by_id[cid]["rarity"] in ("epic", "legendary", "mythic", "secret") else 1.0)
-                eff_w[cid] = fw
-                tot_w += fw
-        if tot_w > 0:
-            for cid, fw in eff_w.items():
-                pct = (fw / tot_w) * 100.0
-                crate_sources.setdefault(cid, []).append(f"{cr['name']} ({pct:.2f}%)")
-
-    # Сортировка как в GGTD Cards: от самых редких (Secret -> Mythic -> ... -> Common)
-    all_cards.sort(key=lambda c: (RARITIES.get(c["rarity"], ("", "", 0, 0))[2], c["id"]), reverse=True)
-
-    per = 6
-    tp = max(1, (len(all_cards) + per - 1) // per)
-    page = max(0, min(page, tp - 1))
-    chunk = all_cards[page * per : (page + 1) * per]
-
-    lines = [
-        f"📖 <b>ИНДЕКС КАРТ (Стр. {page + 1}/{tp})</b>",
-        f"🧩 Открыто: <b>{len(discovered)}/{len(all_cards)}</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━",
-    ]
-    if l_mult > 1.0:
-        lines.append(f"🍀 <b>УДАЧА ПОВЫШЕНА (x{l_mult:.2f})! Шансы пересчитаны!</b>\n")
-
-    for i, c in enumerate(chunk, page * per + 1):
-        ex_tot, ex_sh, ex_inf = await db.get_card_exist_stats(c["id"])
-        r_badge = fmt_rarity_badge(c["rarity"])
-        c_ico = CARD_CLASSES.get(c["class_type"], ("🎯", ""))[0]
-        base_inf = RARITIES.get(c["rarity"], ("", "", 1, 1.0))[3]
-        eff_inf = calc_infect_chance(base_inf, r_inf, l_mult)
-
-        src_parts = []
-        if not c["hide_from_ai"]:
-            src_parts.append(f"🦠 Зараж.: {fmt_pct(eff_inf)}%")
-        if c["id"] in crate_sources:
-            src_parts.append("📦 " + ", ".join(crate_sources[c["id"]][:2]))
-        src_str = " | ".join(src_parts) if src_parts else "Эксклюзив"
-
-        sub_exist = []
-        if ex_sh > 0:
-            sub_exist.append(f"✨ Shiny: {ex_sh}")
-        if ex_inf > 0:
-            sub_exist.append(f"🦠 Инф: {ex_inf}")
-        sub_line = f"\n   └ <i>Из них: {', '.join(sub_exist)}</i>" if sub_exist else ""
-
-        if c["id"] in discovered:
-            if c["class_type"] == "Booster":
-                stat_line = f"✨ Бафф: ATK x{c['booster_dmg_mult']} // HP x{c['booster_hp_mult']}"
-            elif c["class_type"] == "Healer":
-                stat_line = f"💗 Лечение: {c['atk']} // ❤️ Здоровье: {c['hp']}"
-            else:
-                stat_line = f"⚔️ Урон: {c['atk']} // ❤️ Здоровье: {c['hp']}"
-            lines.append(
-                f"{i}. {c_ico} <b>{esc(c['name'])}</b>\n"
-                f"   └ 💎 {r_badge}\n"
-                f"   └ 🎯 {src_str}\n"
-                f"   └ {stat_line}\n"
-                f"   └ 🌍 Существует: <b>{ex_tot} шт.</b>{sub_line}\n"
-            )
-        else:
-            lines.append(
-                f"{i}. <b>???</b> <i>(Не открыто)</i>\n"
-                f"   └ 💎 {r_badge}\n"
-                f"   └ 🎯 {src_str}\n"
-                f"   └ 🌍 Существует: <b>{ex_tot} шт.</b>{sub_line}\n"
-            )
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"idx:{page - 1}"))
-    nav.append(InlineKeyboardButton(text=f"{page + 1}/{tp}", callback_data="noop"))
-    if page < tp - 1:
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"idx:{page + 1}"))
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        nav,
-        [InlineKeyboardButton(text="🎒 Инвентарь", callback_data="inv:all:0"), InlineKeyboardButton(text="🛡 Колода", callback_data="eq:home")],
-    ])
-    await render_view(target, "\n".join(lines), kb)
-
-
-@router.message(F.text == "🛡 Колода")
-async def menu_deck(m: Message, state: FSMContext):
-    await state.clear()
-    await render_deck(m, m.from_user.id)
-
-
-@router.message(F.text == "🎒 Инвентарь")
-async def menu_inv(m: Message, state: FSMContext):
-    await state.clear()
-    await render_inventory(m, m.from_user.id, "all", 0)
-
-
-@router.message(F.text == "📖 Индекс")
-async def menu_idx(m: Message, state: FSMContext):
-    await state.clear()
-    await render_index(m, m.from_user.id, 0)
-
-
-@router.callback_query(F.data == "eq:home")
-async def cb_eq_home(cb: CallbackQuery):
-    await render_deck(cb, cb.from_user.id)
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("eq:slot:"))
-async def cb_eq_slot(cb: CallbackQuery):
-    _, _, s, p = cb.data.split(":")
-    await render_slot_picker(cb, cb.from_user.id, int(s), int(p))
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("eq:put:"))
-async def cb_eq_put(cb: CallbackQuery):
-    _, _, s, iid = cb.data.split(":")
-    await db.set_equip_slot(cb.from_user.id, int(iid), int(s))
-    await cb.answer(f"✅ Надето в слот #{s}!")
-    await render_deck(cb, cb.from_user.id)
-
-
-@router.callback_query(F.data.startswith("eq:un:"))
-async def cb_eq_un(cb: CallbackQuery):
-    await db.set_equip_slot(cb.from_user.id, int(cb.data.split(":")[2]), 0)
-    await cb.answer("➖ Снято!")
-    await render_deck(cb, cb.from_user.id)
-
-
-@router.callback_query(F.data == "eq:clear")
-async def cb_eq_clear(cb: CallbackQuery):
-    await db.clear_equip(cb.from_user.id)
-    await cb.answer("❌ Колода очищена!")
-    await render_deck(cb, cb.from_user.id)
-
-
-@router.callback_query(F.data == "eq:auto")
-async def cb_eq_auto(cb: CallbackQuery):
-    uid = cb.from_user.id
-    inv = [c for c in await db.get_inventory(uid) if not c.get("market_id")]
-    if not inv:
-        await cb.answer("Инвентарь пуст!", show_alert=True)
-        return
-    await db.clear_equip(uid)
-    chosen: List[Dict[str, Any]] = []
-    boosters = sorted([c for c in inv if c["class_type"] == "Booster"], key=lambda x: calc_card_stats(x)["b_dmg"], reverse=True)
-    if boosters:
-        chosen.append(boosters[0])
-    by_pwr = sorted(inv, key=lambda x: calc_card_stats(x)["power"], reverse=True)
-    for c in by_pwr:
-        if len(chosen) >= MAX_DECK_SIZE:
-            break
-        if c["inv_id"] not in {x["inv_id"] for x in chosen}:
-            chosen.append(c)
-    for idx, c in enumerate(chosen, 1):
-        await db.set_equip_slot(uid, c["inv_id"], idx)
-    await cb.answer("⚡ Оптимальная колода собрана!", show_alert=True)
-    await render_deck(cb, uid)
-
-
-@router.callback_query(F.data.startswith("inv:"))
-async def cb_inv(cb: CallbackQuery):
-    _, flt, p = cb.data.split(":")
-    await render_inventory(cb, cb.from_user.id, flt, int(p))
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("idx:"))
-async def cb_idx(cb: CallbackQuery):
-    await render_index(cb, cb.from_user.id, int(cb.data.split(":")[1]))
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("c:v:"))
-async def cb_cv(cb: CallbackQuery):
-    _, _, iid, flt, p = cb.data.split(":")
-    await render_card_view(cb, cb.from_user.id, int(iid), flt, int(p))
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("c:eq:"))
-async def cb_ceq(cb: CallbackQuery):
-    _, _, iid, sl, flt, p = cb.data.split(":")
-    await db.set_equip_slot(cb.from_user.id, int(iid), int(sl))
-    await cb.answer(f"✅ Надето в слот #{sl}!")
-    await render_card_view(cb, cb.from_user.id, int(iid), flt, int(p))
-
-
-@router.callback_query(F.data.startswith("c:un:"))
-async def cb_cun(cb: CallbackQuery):
-    _, _, iid, flt, p = cb.data.split(":")
-    await db.set_equip_slot(cb.from_user.id, int(iid), 0)
-    await cb.answer("➖ Снято!")
-    await render_card_view(cb, cb.from_user.id, int(iid), flt, int(p))
-
-
-@router.callback_query(F.data.startswith("c:sgn:"))
-async def cb_csgn(cb: CallbackQuery):
-    _, _, iid, flt, p = cb.data.split(":")
-    uid = cb.from_user.id
-    role = await db.get_signer_role(uid)
-    if not role:
-        await cb.answer("Нет прав Сигнера!", show_alert=True)
-        return
-    u = await db.get_user(uid)
-    who = f"@{u['username']}" if u and u.get("username") else (u["full_name"] if u else str(uid))
-    await db.sign_inv_item(int(iid), role, who)
-    pct = cfg_int("admin_sign_pct") if role == "admin" else cfg_int("partner_sign_pct")
-    await cb.answer(f"✍️ Подписано (+{pct}% ATK/HP)!", show_alert=True)
-    await render_card_view(cb, uid, int(iid), flt, int(p))
-
-
-@router.callback_query(F.data.startswith("c:sell:"))
-async def cb_csell(cb: CallbackQuery, state: FSMContext):
-    iid = int(cb.data.split(":")[2])
-    it = await db.get_inv_item(iid)
-    if not it or it["user_id"] != cb.from_user.id or it.get("market_id"):
-        await cb.answer("Карта недоступна.", show_alert=True)
-        return
-    await state.set_state(PlayerFSM.market_price)
-    await state.update_data(sell_id=iid)
-    await cb.message.answer(f"🏷 Введите цену для <b>{esc(it['name'])}</b> (50–500000 💰).\n<i>Вы получите <b>80%</b>, комиссия рынка — <b>20%</b>.</i>")
-    await cb.answer()
-
-
-@router.message(PlayerFSM.market_price)
-async def fsm_sell(m: Message, state: FSMContext):
-    iid = (await state.get_data()).get("sell_id")
-    await state.clear()
-    try:
-        pr = int((m.text or "").strip())
-        if not (50 <= pr <= 500000):
-            raise ValueError
-    except ValueError:
-        await m.answer("❌ Введите число от 50 до 500000.")
-        return
-    it = await db.get_inv_item(iid)
-    if not it or it["user_id"] != m.from_user.id or it.get("market_id"):
-        await m.answer("❌ Карта недоступна.")
-        return
-    await db.create_market_lot(m.from_user.id, iid, pr)
-    await m.answer(f"✅ <b>{esc(it['name'])}</b> выставлена за <b>{pr} 💰</b> (получите {int(pr * 0.8)} 💰).")
-
-
-# ==============================================================================
-# 6. БОИ 4×4 ПРОТИВ АЛЬЯНСА (БЕЗ ПРОПУСКА БОЯ!) И ЗАРАЖЕНИЕ ПРИ УБИЙСТВЕ
-# ==============================================================================
-
-async def render_battle_hub(target: Message | CallbackQuery, uid: int):
-    u = await db.get_user(uid)
-    _, r_name, _, r_rew, r_inf = get_rank_info(u["trophies"])
-    armed = u["armed_parasite"]
-    if armed in PARASITES and u[PARASITES[armed][1]] <= 0:
-        armed = "none"
-        await db.update_user(uid, armed_parasite="none")
-    p_bonus = cfg_int(f"p_{armed}_bonus") if armed in PARASITES else 0
-    p_label = f"{PARASITES[armed][0]} (+{p_bonus}%)" if armed in PARASITES else "Без паразита (+0%)"
-    mod_inf = sum(v[3] for k, v in BATTLE_MODS.items() if u.get(k))
-    l_mult, _, c_mult, _ = get_active_events()
-    tot_bonus = r_inf + p_bonus + u["pity_bonus"] + mod_inf
-    ex_com = fmt_pct(calc_infect_chance(1.0, tot_bonus, l_mult))
-    ex_leg = fmt_pct(calc_infect_chance(0.0625, tot_bonus, l_mult))
-
-    text = (
-        f"⚔️ <b>БИТВА ЗА СКИБИДИ-ТУАЛЕТОВ (4×4)</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🎖 Ранг: <b>{r_name}</b> (🏆 {u['trophies']} | 💰 x{r_rew} | 🦠 +{r_inf}%)\n"
-        f"🦠 Паразит на бой: <b>{p_label}</b>\n"
-        f"🎯 Пити: <b>+{u['pity_bonus']}%</b> | 🧬 Моды: <b>+{mod_inf}%</b>\n"
-        f"📊 Шанс заразить в бою: Common <b>{ex_com}%</b> | Leg <b>{ex_leg}%</b>\n"
-        + (f"🎉 Ивенты: 🍀x{l_mult} | 💰x{c_mult}\n" if (l_mult > 1 or c_mult > 1) else "")
-        + "\n👇 Выберите сложность отряда Альянса:"
-    )
-    rows = [
-        [InlineKeyboardButton(text=f"{name} (💰x{sc} | 🦠+{ib}%)", callback_data=f"btl:go:{k}")]
-        for k, (name, _, sc, _, ib) in DIFFICULTIES.items()
-    ]
-    rows.append([
-        InlineKeyboardButton(text="🦠 Выбрать паразита", callback_data="btl:par"),
-        InlineKeyboardButton(text="🧬 Модификаторы", callback_data="btl:mods"),
-    ])
-    await render_view(target, text, InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@router.message(F.text == "⚔️ В бой (Альянс)")
-async def menu_battle(m: Message, state: FSMContext):
-    await state.clear()
-    await render_battle_hub(m, m.from_user.id)
-
-
-@router.callback_query(F.data == "btl:hub")
-async def cb_btl_hub(cb: CallbackQuery):
-    await render_battle_hub(cb, cb.from_user.id)
-    await cb.answer()
-
-
-@router.callback_query(F.data == "btl:mods")
-async def cb_btl_mods(cb: CallbackQuery):
-    await render_mods(cb, cb.from_user.id, "btl:hub")
-    await cb.answer()
-
-
-@router.callback_query(F.data == "btl:par")
-async def cb_btl_par(cb: CallbackQuery):
-    u = await db.get_user(cb.from_user.id)
-    armed = u["armed_parasite"]
-    rows = [[InlineKeyboardButton(text=("✅ " if armed == "none" else "") + "Без паразита (+0%)", callback_data="btl:sp:none")]]
-    for k in ("common", "upgraded", "elite"):
-        name, col, _, bon = get_parasite_info(k)
-        mark = "✅ " if armed == k else ""
-        rows.append([InlineKeyboardButton(text=f"{mark}{name} (+{bon}%) — {u[col]} шт.", callback_data=f"btl:sp:{k}")])
-    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="btl:hub")])
-    await render_view(
-        cb,
-        "🦠 <b>ВЫБОР ПАРАЗИТА НА БОЙ</b>\n1 паразит тратится при старте боя и усиливает шанс заражения всех 4 врагов.",
-        InlineKeyboardMarkup(inline_keyboard=rows),
-    )
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("btl:sp:"))
-async def cb_btl_sp(cb: CallbackQuery):
-    p_key = cb.data.split(":")[2]
-    uid = cb.from_user.id
-    if p_key != "none":
-        u = await db.get_user(uid)
-        if u[PARASITES[p_key][1]] <= 0:
-            await cb.answer("У вас нет этого паразита! Купите в Лаборатории.", show_alert=True)
-            return
-    await db.update_user(uid, armed_parasite=p_key)
-    await cb.answer("✅ Паразит выбран!")
-    await render_battle_hub(cb, uid)
-
-
-@router.callback_query(F.data.startswith("btl:surr:"))
-async def cb_btl_surr(cb: CallbackQuery):
-    bid = cb.data.split(":")[2]
-    st = ACTIVE_BATTLES.get(bid)
-    if not st or cb.from_user.id != st["uid"]:
-        await cb.answer("Бой уже завершён.")
-        return
-    st["surrendered"] = True
-    await cb.answer("🏳️ Вы сдались!", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("btl:go:"))
-async def cb_btl_go(cb: CallbackQuery):
-    uid = cb.from_user.id
-    if uid in USERS_IN_BATTLE:
-        await cb.answer("Вы уже в бою!", show_alert=True)
-        return
-    deck = await db.get_inventory(uid, only_equipped=True)
-    if not deck:
-        await cb.answer("Сначала наденьте карты в «🛡 Колода»!", show_alert=True)
-        return
-    diff_key = cb.data.split(":")[2]
-    if diff_key not in DIFFICULTIES:
-        return
-    USERS_IN_BATTLE.add(uid)
-    await cb.answer("⚔️ Начинаем бой!")
-    asyncio.create_task(run_4v4_battle_task(cb.message, uid, diff_key, deck))
-
-
-async def safe_edit_btl(msg: Message, text: str, kb: Optional[InlineKeyboardMarkup] = None) -> None:
-    try:
-        await msg.edit_text(text[:4096], reply_markup=kb)
-    except TelegramRetryAfter as e:
-        await asyncio.sleep(e.retry_after)
-        try:
-            await msg.edit_text(text[:4096], reply_markup=kb)
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-
-async def run_4v4_battle_task(origin: Message, uid: int, diff_key: str, deck: List[Dict[str, Any]]) -> None:
-    bid = uuid.uuid4().hex[:10]
-    ACTIVE_BATTLES[bid] = {"uid": uid, "surrendered": False}
-    try:
-        u = await db.get_user(uid)
-        r_idx, r_name, _, r_rew, r_inf = get_rank_info(u["trophies"])
-        diff_name, _, diff_scale, _, diff_inf = DIFFICULTIES[diff_key]
-        l_mult, _, c_mult, _ = get_active_events()
-
-        # Расход выбранного паразита
-        armed = u["armed_parasite"]
-        p_bonus = 0
-        if armed in PARASITES and u[PARASITES[armed][1]] > 0:
-            await db.add_parasite(uid, armed, -1)
-            p_bonus = cfg_int(f"p_{armed}_bonus")
-        elif armed != "none":
-            await db.update_user(uid, armed_parasite="none")
-
-        mods = {k: u.get(k, 0) for k in BATTLE_MODS}
-        mod_coin = sum(v[1] for k, v in BATTLE_MODS.items() if mods[k])
-        mod_tr = sum(v[2] for k, v in BATTLE_MODS.items() if mods[k])
-        mod_inf = sum(v[3] for k, v in BATTLE_MODS.items() if mods[k])
-
-        infect_bonus_pct = r_inf + diff_inf + p_bonus + u["pity_bonus"] + mod_inf
-
-        p_hp_m = 1.3 if mods["mod_player_hp"] else 1.0
-        p_crit = 0.20 if mods["mod_player_crit"] else 0.0
-        t1 = [build_player_unit(c, hp_mult=p_hp_m) for c in deck]
-        t2 = await generate_enemy_team(r_idx, diff_key)
-
-        if mods["mod_enemy_hp"]:
-            for e in t2:
-                e["hp"] = int(e["hp"] * 1.5)
-                e["max_hp"] = e["hp"]
-        if mods["mod_enemy_stats"]:
-            for e in t2:
-                e["hp"] = int(e["hp"] * 1.25)
-                e["max_hp"] = e["hp"]
-                e["atk"] = int(e["atk"] * 1.25)
-
-        logs: List[str] = []
-        apply_boosters_team(t1, u["full_name"], logs)
-        apply_boosters_team(t2, f"Альянс ({diff_name})", logs)
-
-        title = f"⚔️ {diff_name} | {r_name}"
-        # Пропуск боя убран — оставлена только кнопка «Сдаться»
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏳️ Сдаться", callback_data=f"btl:surr:{bid}")]])
-        msg = await origin.answer(render_battle_screen(title, u["full_name"], t1, f"Отряд ({diff_name})", t2, logs, 0, 0), reply_markup=kb)
-
-        delay = cfg_float("battle_delay_sec")
-        dmg_tracker: Dict[int, float] = {}
-        infected_drops: List[Dict[str, Any]] = []
-        st = ACTIVE_BATTLES[bid]
-        winner = 0
-
-        for rnd in range(1, 36):
-            if st["surrendered"]:
-                winner = 2
-                break
-            if not any(x["hp"] > 0 for x in t2):
-                winner = 1
-                break
-            if not any(x["hp"] > 0 for x in t1):
-                winner = 2
-                break
-
-            perform_combat_turn(t1, t2, True, logs, dmg_tracker, infected_drops, infect_bonus_pct, l_mult, crit_chance=p_crit)
-            if any(x["hp"] > 0 for x in t2):
-                if mods["mod_enemy_regen"]:
-                    for e in t2:
-                        if e["hp"] > 0:
-                            e["hp"] = min(e["max_hp"], e["hp"] + max(2, int(e["max_hp"] * 0.05)))
-                perform_combat_turn(t2, t1, False, logs, dmg_tracker, infected_drops, infect_bonus_pct, l_mult)
-
-            await safe_edit_btl(msg, render_battle_screen(title, u["full_name"], t1, f"Отряд ({diff_name})", t2, logs, rnd, len(infected_drops)), kb)
-            ticks = max(1, int(delay / 0.2))
-            for _ in range(ticks):
-                if st["surrendered"]:
-                    break
-                await asyncio.sleep(0.2)
-
-        if winner == 0:
-            r1 = sum(x["hp"] for x in t1) / max(1, sum(x["max_hp"] for x in t1))
-            r2 = sum(x["hp"] for x in t2) / max(1, sum(x["max_hp"] for x in t2))
-            winner = 1 if r1 >= r2 else 2
-
-        total_dmg = sum(dmg_tracker.values())
-        lvl_notes = []
-        for inv_id, dmg in dmg_tracker.items():
-            gained = round(dmg * XP_PER_DAMAGE, 2)
-            if gained <= 0:
-                continue
-            item = await db.get_inv_item(inv_id)
-            if item and item["user_id"] == uid:
-                nl, nx, ups = apply_card_xp(item["level"], item["xp"], gained)
-                await db.update_inv_xp(inv_id, nl, nx)
-                if ups > 0:
-                    lvl_notes.append(f"⭐ {esc(item['name'])} ➔ Ур.{nl}")
-
-        fresh = await db.get_user(uid)
-        if winner == 1:
-            coins_won = max(15, int(random.randint(35, 85) * r_rew * diff_scale * max(0.2, 1.0 + mod_coin) * c_mult))
-            base_tr = random.randint(1, 2) if r_idx >= 29 else max(5, 18 - int((r_idx / 28) * 11))
-            tr_won = max(1, int(base_tr * diff_scale * (1.0 + mod_tr)))
-
-            await db.add_coins(uid, coins_won)
-            await db.add_trophies(uid, tr_won)
-
-            cur_drops = []
-            for cur in await db.list_currencies():
-                if cur["drop_in_battles"] and (random.random() * 100.0) < (cur["drop_chance"] * l_mult):
-                    amt = random.randint(cur["drop_min"], max(cur["drop_min"], cur["drop_max"]))
-                    await db.add_user_currency(uid, cur["id"], amt)
-                    cur_drops.append(f"+{amt} {esc(cur['name'])}")
-
-            inf_lines = []
-            for d in infected_drops:
-                sh = roll_shiny()
-                _, sn = await db.give_card(uid, d["card_id"], is_shiny=sh, is_infected=1)
-                r_ico = RARITIES.get(d["rarity"], ("", "⚪️", 1, 1.0))[1]
-                sn_s = f" <b>[#{sn:04d}]</b>" if sn else ""
-                sh_s = " ✨<b>SHINY</b>" if sh else ""
-                inf_lines.append(f"  └ 🦠 {r_ico} <b>{esc(d['name'])}</b>{sn_s}{sh_s} ({fmt_pct(d['chance'])}%)")
-
-            new_pity = 0 if infected_drops else min(50, fresh["pity_bonus"] + 2)
-            await db.update_user(
-                uid,
-                wins=fresh["wins"] + 1,
-                total_damage=round(fresh["total_damage"] + total_dmg, 1),
-                infections_success=fresh["infections_success"] + len(infected_drops),
-                pity_bonus=new_pity,
-            )
-
-            fin = [
-                f"🏆 <b>ПОБЕДА СКИБИДИ-ТУАЛЕТОВ!</b> ({diff_name})",
-                "━━━━━━━━━━━━━━━━━━",
-                f"💰 Монеты: <b>+{coins_won}</b>" + (f" (Ивент x{c_mult})" if c_mult > 1 else ""),
-                f"🏆 Кубки: <b>+{tr_won}</b> | 💥 Урон: <b>{int(total_dmg)}</b>",
-            ]
-            if cur_drops:
-                fin.append("🪙 Дроп валют: <b>" + ", ".join(cur_drops) + "</b>")
-            if inf_lines:
-                fin.append("\n🦠💥 <b>ЗАРАЖЁННЫЕ ТРОФЕИ:</b>\n" + "\n".join(inf_lines))
-            else:
-                fin.append(f"🎯 Заражений нет — Пити: <b>+{new_pity}%</b>")
-            if lvl_notes:
-                fin.append("📈 Ап уровней: " + ", ".join(lvl_notes[:4]))
-        else:
-            tr_loss = random.randint(25, 45) if r_idx >= 29 else 3
-            await db.add_trophies(uid, -tr_loss)
-            await db.update_user(uid, losses=fresh["losses"] + 1, total_damage=round(fresh["total_damage"] + total_dmg, 1))
-            fin = [
-                f"💀 <b>ПОРАЖЕНИЕ ОТ АЛЬЯНСА</b> ({diff_name})",
-                "━━━━━━━━━━━━━━━━━━",
-                f"🏆 Потеряно кубков: <b>-{tr_loss}</b> | 💥 Урон: <b>{int(total_dmg)}</b>",
-                "<i>Заражённые враги сбежали (для захвата нужна победа).</i>",
-            ]
-            if lvl_notes:
-                fin.append("📈 Ап уровней: " + ", ".join(lvl_notes[:4]))
-
-        end_kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🔁 Ещё бой", callback_data=f"btl:go:{diff_key}"),
-            InlineKeyboardButton(text="⚔️ К сложностям", callback_data="btl:hub"),
-        ]])
-        await safe_edit_btl(msg, "\n".join(fin), end_kb)
-    except Exception as exc:
-        logger.exception("Battle error: %s", exc)
-    finally:
-        ACTIVE_BATTLES.pop(bid, None)
-        USERS_IN_BATTLE.discard(uid)
-
-
-# ==============================================================================
-# 7. КРЕЙТЫ И ЛАБОРАТОРИЯ (МАССОВАЯ ПОКУПКА И КРАФТ ПАРАЗИТОВ)
-# ==============================================================================
-
-async def render_lab(target: Message | CallbackQuery, uid: int):
-    u = await db.get_user(uid)
-    crates = await db.list_crates(active_only=True)
-    curs = {c["id"]: c["name"] for c in await db.list_currencies()}
-    cp, cb = cfg_int("p_common_price"), cfg_int("p_common_bonus")
-    up, ub = cfg_int("p_upgraded_price"), cfg_int("p_upgraded_bonus")
-    ep, eb = cfg_int("p_elite_price"), cfg_int("p_elite_bonus")
-    l_mult, _, _, _ = get_active_events()
-
-    txt = (
-        f"📦 <b>КРЕЙТЫ И ЛАБОРАТОРИЯ</b>\n━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Монеты: <b>{u['coins']}</b>\n"
-        f"🦠 Паразиты: Обыч. <b>{u['p_common']}</b> | Улучш. <b>{u['p_upgraded']}</b> | Элит. <b>{u['p_elite']}</b>\n\n"
-        f"🧪 <b>Паразиты (бонус % от шанса заражения):</b>\n"
-        f"• 🦠 Обыч. (+{cb}% — {cp}💰)\n"
-        f"• ☣️ Улучш. (+{ub}% — {up}💰)\n"
-        f"• 💎 Элит. (+{eb}% — {ep}💰)\n\n"
-        f"📦 <b>Кейсы</b> (✨ Shiny: <b>{fmt_pct(cfg_float('shiny_chance_pct') * l_mult)}%</b>):"
-    )
-    rows = [
-        [
-            InlineKeyboardButton(text=f"🦠 Купить Обыч. ({cp}💰)", callback_data="lab:pm:common"),
-            InlineKeyboardButton(text=f"☣️ Купить Улучш. ({up}💰)", callback_data="lab:pm:upgraded"),
-        ],
-        [InlineKeyboardButton(text=f"💎 Купить Элитного ({ep}💰)", callback_data="lab:pm:elite")],
-        [
-            InlineKeyboardButton(text="⚗️ Крафт 3🦠➔1☣️", callback_data="lab:cr:upgraded:1"),
-            InlineKeyboardButton(text="⚗️ МАКС 🦠➔☣️", callback_data="lab:cr:upgraded:max"),
-        ],
-        [
-            InlineKeyboardButton(text="⚗️ Крафт 3☣️➔1💎", callback_data="lab:cr:elite:1"),
-            InlineKeyboardButton(text="⚗️ МАКС ☣️➔💎", callback_data="lab:cr:elite:max"),
-        ],
-    ]
-    for cr in crates:
-        cname = "💰" if cr["currency_id"] == 0 else curs.get(cr["currency_id"], "🪙")
-        rows.append([InlineKeyboardButton(text=f"📦 {cr['name']} — {cr['price']} {cname}", callback_data=f"cr:v:{cr['id']}")])
-    await render_view(target, txt, InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-async def render_parasite_buy_menu(target: Message | CallbackQuery, uid: int, p_key: str):
-    """Меню массовой покупки выбранного паразита (x1, x3, x5, x10, x25, МАКС)."""
-    u = await db.get_user(uid)
-    name, col, price, bonus = get_parasite_info(p_key)
-    owned = u[col]
-    max_buy = u["coins"] // price if price > 0 else 0
-
-    txt = (
-        f"🧪 <b>ПОКУПКА: {name}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🦠 Бонус к шансу заражения: <b>+{bonus}%</b> от шанса\n"
-        f"💵 Цена за 1 шт.: <b>{price} 💰</b>\n"
-        f"💰 Ваш баланс: <b>{u['coins']}</b> | У вас есть: <b>{owned} шт.</b>\n\n"
-        f"👇 Выберите количество для покупки:"
-    )
-    rows = [
-        [
-            InlineKeyboardButton(text=f"x1 ({price}💰)", callback_data=f"lab:buy:{p_key}:1"),
-            InlineKeyboardButton(text=f"x3 ({price * 3}💰)", callback_data=f"lab:buy:{p_key}:3"),
-            InlineKeyboardButton(text=f"x5 ({price * 5}💰)", callback_data=f"lab:buy:{p_key}:5"),
-        ],
-        [
-            InlineKeyboardButton(text=f"x10 ({price * 10}💰)", callback_data=f"lab:buy:{p_key}:10"),
-            InlineKeyboardButton(text=f"x25 ({price * 25}💰)", callback_data=f"lab:buy:{p_key}:25"),
-        ],
-    ]
-    if max_buy > 0:
-        rows.append([InlineKeyboardButton(text=f"🔥 Купить МАКС ({max_buy} шт. — {max_buy * price}💰)", callback_data=f"lab:buy:{p_key}:max")])
-    rows.append([InlineKeyboardButton(text="🔙 Назад в Лабораторию", callback_data="lab:home")])
-    await render_view(target, txt, InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@router.message(F.text == "📦 Крейты и Лаба")
-async def menu_lab(m: Message, state: FSMContext):
-    await state.clear()
-    await render_lab(m, m.from_user.id)
-
-
-@router.callback_query(F.data == "lab:home")
-async def cb_lab_home(cb: CallbackQuery):
-    await render_lab(cb, cb.from_user.id)
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("lab:pm:"))
-async def cb_lab_pm(cb: CallbackQuery):
-    p_key = cb.data.split(":")[2]
-    if p_key not in PARASITES:
-        return
-    await render_parasite_buy_menu(cb, cb.from_user.id, p_key)
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("lab:buy:"))
-async def cb_lab_buy(cb: CallbackQuery):
-    _, _, pk, amt_s = cb.data.split(":")
-    if pk not in PARASITES:
-        return
-    name, _, price, _ = get_parasite_info(pk)
-    u = await db.get_user(cb.from_user.id)
-
-    amt = (u["coins"] // price if price > 0 else 0) if amt_s == "max" else int(amt_s)
-    if amt <= 0:
-        await cb.answer(f"Недостаточно монет! Нужно минимум {price} 💰.", show_alert=True)
-        return
-    cost = price * amt
-    if u["coins"] < cost:
-        await cb.answer(f"Недостаточно монет! Нужно {cost} 💰.", show_alert=True)
-        return
-    await db.add_coins(u["user_id"], -cost)
-    await db.add_parasite(u["user_id"], pk, amt)
-    await cb.answer(f"✅ Куплено {amt} шт. «{name}» (-{cost}💰)!", show_alert=True)
-    await render_parasite_buy_menu(cb, u["user_id"], pk)
-
-
-@router.callback_query(F.data.startswith("lab:cr:"))
-async def cb_lab_cr(cb: CallbackQuery):
-    _, _, tgt, mode = cb.data.split(":")
-    src = "common" if tgt == "upgraded" else "upgraded"
-    u = await db.get_user(cb.from_user.id)
-    have = u[PARASITES[src][1]]
-    crafts = (have // 3) if mode == "max" else (1 if have >= 3 else 0)
-    if crafts <= 0:
-        await cb.answer(f"Нужно минимум 3 шт. «{PARASITES[src][0]}»!", show_alert=True)
-        return
-    await db.add_parasite(u["user_id"], src, -(crafts * 3))
-    await db.add_parasite(u["user_id"], tgt, crafts)
-    await cb.answer(f"⚗️ Скрафчено {crafts} шт. «{PARASITES[tgt][0]}»!", show_alert=True)
-    await render_lab(cb, u["user_id"])
-
-
-@router.callback_query(F.data.startswith("cr:v:"))
-async def cb_cr_view(cb: CallbackQuery):
-    cid = int(cb.data.split(":")[2])
-    cr = await db.get_crate(cid)
-    if not cr or not cr["active"]:
-        await cb.answer("Кейс недоступен.", show_alert=True)
-        return
-    cur_obj = await db.get_currency(cr["currency_id"]) if cr["currency_id"] else None
-    cur_name = cur_obj["name"] if cur_obj else "💰 Монет"
-    bal = await db.get_user_currency_bal(cb.from_user.id, cr["currency_id"])
-    all_c = {str(x["id"]): x for x in await db.list_cards()}
-    l_mult, _, _, _ = get_active_events()
-
-    weighted = []
-    for k, w in cr["cards"].items():
-        co = all_c.get(str(k))
-        if co and float(w) > 0:
-            fw = float(w) * (l_mult if co["rarity"] in ("epic", "legendary", "mythic", "secret") else 1.0)
-            weighted.append((co, fw))
-    tot_w = sum(x[1] for x in weighted)
-    weighted.sort(key=lambda x: x[1], reverse=True)
-
-    lines = [
-        f"📦 <b>{esc(cr['name'])}</b>",
-        f"<i>{esc(cr['description'])}</i>" if cr["description"] else "",
-        f"💵 Цена: <b>{cr['price']} {esc(cur_name)}</b> | Баланс: <b>{bal}</b>",
-        "━━━━━━━━━━━━━━━━━━",
-        "🎲 <b>Шансы:</b>",
-    ]
-    for co, fw in weighted[:12]:
-        r_ico = RARITIES.get(co["rarity"], ("", "⚪️", 1, 1.0))[1]
-        lines.append(f"• {r_ico} <b>{esc(co['name'])}</b> — {(fw / tot_w * 100):.2f}%")
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Открыть x1 ({cr['price']})", callback_data=f"cr:op:{cid}:1"), InlineKeyboardButton(text=f"x5 ({cr['price'] * 5})", callback_data=f"cr:op:{cid}:5")],
-        [InlineKeyboardButton(text=f"Открыть x10 ({cr['price'] * 10})", callback_data=f"cr:op:{cid}:10")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="lab:home")],
-    ])
-    await render_view(cb, "\n".join(x for x in lines if x), kb, photo=cr.get("photo_id") or None)
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("cr:op:"))
-async def cb_cr_open(cb: CallbackQuery):
-    _, _, cid_s, amt_s = cb.data.split(":")
-    cid, amt = int(cid_s), int(amt_s)
-    cr = await db.get_crate(cid)
-    if not cr or not cr["active"]:
-        await cb.answer("Кейс недоступен.", show_alert=True)
-        return
-    uid = cb.from_user.id
-    cost = cr["price"] * amt
-    bal = await db.get_user_currency_bal(uid, cr["currency_id"])
-    if bal < cost:
-        await cb.answer(f"Недостаточно средств! Нужно {cost}.", show_alert=True)
-        return
-    all_c = {str(x["id"]): x for x in await db.list_cards()}
-    l_mult, _, _, _ = get_active_events()
-    pool, weights = [], []
-    for k, w in cr["cards"].items():
-        co = all_c.get(str(k))
-        if co and float(w) > 0:
-            pool.append(co)
-            weights.append(float(w) * (l_mult if co["rarity"] in ("epic", "legendary", "mythic", "secret") else 1.0))
-    if not pool:
-        await cb.answer("Кейс пуст.", show_alert=True)
-        return
-
-    await db.add_user_currency(uid, cr["currency_id"], -cost)
-    drops = random.choices(pool, weights=weights, k=amt)
-    lines = [f"🎉 <b>ОТКРЫТО {amt}x «{esc(cr['name'])}»</b>", "━━━━━━━━━━━━━━━━━━"]
-    counts: Dict[Tuple[str, str, int, int], int] = {}
-    last_photo = None
-    for c in drops:
-        sh = roll_shiny()
-        _, sn = await db.give_card(uid, c["id"], is_shiny=sh)
-        r_ico = RARITIES.get(c["rarity"], ("", "⚪️", 1, 1.0))[1]
-        key = (r_ico, c["name"], sh, sn)
-        counts[key] = counts.get(key, 0) + 1
-        if amt == 1:
-            last_photo = c.get("photo_id") or None
-    for (r_ico, name, sh, sn), q in counts.items():
-        sh_s = "✨<b>SHINY</b> " if sh else ""
-        sn_s = f" <b>[#{sn:04d}]</b>" if sn else ""
-        q_s = f" x{q}" if q > 1 else ""
-        lines.append(f"• {r_ico} {sh_s}<b>{esc(name)}</b>{sn_s}{q_s}")
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"🔁 Ещё x{amt}", callback_data=f"cr:op:{cid}:{amt}"), InlineKeyboardButton(text="🔙 Назад", callback_data="lab:home")]])
-    await render_view(cb, "\n".join(lines), kb, photo=last_photo)
-    await cb.answer("🎉 Открыто!")
-
-
-# ==============================================================================
-# 8. МУЛЬТИПЛЕЕР: МИРОВОЙ БОСС И P2P-РЫНОК (80/20)
-# ==============================================================================
-
-def mp_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌍 Мировой Босс (Общий рейд)", callback_data="mp:wb")],
-        [InlineKeyboardButton(text="🏪 P2P Рынок игроков (80/20)", callback_data="mp:mkt:0")],
-    ])
-
-
-@router.message(F.text == "🌐 Мультиплеер")
-async def menu_mp(m: Message, state: FSMContext):
-    await state.clear()
-    wb = await db.get_world_boss()
-    wb_s = f"🟢 {esc(wb['name'])} ({wb['current_hp']} HP)" if wb else "⚪️ Спит"
-    await m.answer(
-        f"🌐 <b>МУЛЬТИПЛЕЕР ХАБ</b>\n━━━━━━━━━━━━━━━━━━\n"
-        f"🌍 Мировой Босс: {wb_s}\n\n"
-        f"• <b>🌍 Мировой Босс:</b> бейте Титана всем сервером — Топ-3 получают монеты и шанс заразить его.\n"
-        f"• <b>🏪 P2P Рынок:</b> продажа редких ✨Shiny, 🦠Инфектед и серийных карт (80% продавцу, 20% комиссия).",
-        reply_markup=mp_kb(),
-    )
-
-
-@router.callback_query(F.data == "mp:hub")
-async def cb_mp_hub(cb: CallbackQuery):
-    wb = await db.get_world_boss()
-    wb_s = f"🟢 {esc(wb['name'])} ({wb['current_hp']} HP)" if wb else "⚪️ Спит"
-    await render_view(cb, f"🌐 <b>МУЛЬТИПЛЕЕР ХАБ</b>\n🌍 Мировой Босс: {wb_s}", mp_kb())
-    await cb.answer()
-
-
-async def render_wb(target: Message | CallbackQuery):
-    wb = await db.get_world_boss()
-    if not wb:
-        await render_view(target, "🌍 <b>МИРОВОЙ БОСС</b>\n\nСейчас Мировой Босс спит.", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="mp:hub")]]))
-        return
-    top = await db.get_wb_top(wb["id"], 5)
-    t_lines = [f"{i}. {fmt_user(x)} — <b>{int(x['damage'])}</b>" for i, x in enumerate(top, 1)]
-    txt = (
-        f"🌍 <b>МИРОВОЙ БОСС: {esc(wb['name'])}</b>\n━━━━━━━━━━━━━━━━━━\n"
-        f"{make_bar(wb['current_hp'], wb['max_hp'], 10, '🟥', '⬛')}\n"
-        f"❤️ HP: <b>{wb['current_hp']} / {wb['max_hp']}</b>\n\n"
-        f"🏆 <b>Топ-5 урона:</b>\n" + ("\n".join(t_lines) if t_lines else "<i>Ударь первым!</i>")
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚔️ Ударить колодой!", callback_data="mp:wb:hit")],
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="mp:wb"), InlineKeyboardButton(text="🔙 Назад", callback_data="mp:hub")],
-    ])
-    await render_view(target, txt, kb, photo=wb.get("photo_id") or None)
-
-
-@router.callback_query(F.data == "mp:wb")
-async def cb_wb(cb: CallbackQuery):
-    await render_wb(cb)
-    await cb.answer()
-
-
-@router.callback_query(F.data == "mp:wb:hit")
-async def cb_wb_hit(cb: CallbackQuery, bot: Bot):
-    wb = await db.get_world_boss()
-    if not wb:
-        await cb.answer("Босс уже повержен!", show_alert=True)
-        await render_wb(cb)
-        return
-    uid = cb.from_user.id
-    prev = await db.get_wb_hit(wb["id"], uid)
-    now = int(time.time())
-    cd = cfg_int("wb_cooldown_sec")
-    if prev and (now - prev["last_hit"]) < cd:
-        await cb.answer(f"⏳ КД удара: {cd - (now - prev['last_hit'])} сек.", show_alert=True)
-        return
-    deck = await db.get_inventory(uid, only_equipped=True)
-    if not deck:
-        await cb.answer("Соберите колоду!", show_alert=True)
-        return
-
-    dmg = max(20.0, round(sum(calc_card_stats(c)["atk"] for c in deck) * random.uniform(1.1, 1.5), 1))
-    rem = await db.hit_wb(wb["id"], uid, dmg)
-    per_xp = round((dmg / len(deck)) * XP_PER_DAMAGE, 2)
-    for c in deck:
-        nl, nx, _ = apply_card_xp(c["level"], c["xp"], per_xp)
-        await db.update_inv_xp(c["inv_id"], nl, nx)
-
-    if rem <= 0:
-        top = await db.get_wb_top(wb["id"], 10)
-        l_mult, _, c_mult, _ = get_active_events()
-        base_ch = RARITIES.get(wb["rarity"], ("", "", 1, 0.1))[3]
-        wb_ch = calc_infect_chance(base_ch, 500, l_mult)
-        for idx, p in enumerate(top, 1):
-            coins = int(max(150, 950 - (idx - 1) * 140) * c_mult)
-            await db.add_coins(p["user_id"], coins)
-            extra = ""
-            if idx <= 3 and (random.random() * 100.0) < wb_ch:
-                sh = roll_shiny()
-                _, sn = await db.give_card(p["user_id"], wb["card_id"], is_shiny=sh, is_infected=1)
-                extra = f"\n🦠 <b>ВЫ ЗАРАЗИЛИ МИРОВОГО БОССА!</b>{' ✨SHINY' if sh else ''}{f' [#{sn:04d}]' if sn else ''}"
-            try:
-                await bot.send_message(p["user_id"], f"🌍🏆 <b>МИРОВОЙ БОСС {esc(wb['name'])} ПОВЕРЖЕН!</b>\nМесто #{idx} | 💰 +{coins}{extra}")
-            except Exception:
-                pass
-        await cb.answer(f"💥 ФИНАЛЬНЫЙ УДАР -{int(dmg)}!", show_alert=True)
-    else:
-        await cb.answer(f"⚔️ Нанесено {int(dmg)} урона! Осталось {rem} HP.", show_alert=True)
-    await render_wb(cb)
-
-
-async def render_market(target: Message | CallbackQuery, uid: int, page: int = 0):
-    lots = await db.list_market()
-    per = 6
-    tp = max(1, (len(lots) + per - 1) // per)
-    page = max(0, min(page, tp - 1))
-    rows = []
-    for l in lots[page * per : (page + 1) * per]:
-        r_ico = RARITIES.get(l["rarity"], ("", "⚪️", 1, 1.0))[1]
-        sn = f" #{l['serial_number']:04d}" if l["serial_number"] else ""
-        mine = " (Мой)" if l["seller_id"] == uid else ""
-        rows.append([InlineKeyboardButton(text=f"{r_ico}{card_badges(l)} {l['name']}{sn} Ур.{l['level']} — {l['price']}💰{mine}", callback_data=f"mkt:v:{l['market_id']}:{page}")])
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"mp:mkt:{page - 1}"))
-    nav.append(InlineKeyboardButton(text=f"{page + 1}/{tp}", callback_data="noop"))
-    if page < tp - 1:
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"mp:mkt:{page + 1}"))
-    rows.extend([nav, [InlineKeyboardButton(text="🔙 Назад", callback_data="mp:hub")]])
-    await render_view(target, f"🏪 <b>P2P РЫНОК</b> (80% продавцу / 20% комиссия)\nЛотов: <b>{len(lots)}</b>", InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@router.callback_query(F.data.startswith("mp:mkt:"))
-async def cb_mp_mkt(cb: CallbackQuery):
-    await render_market(cb, cb.from_user.id, int(cb.data.split(":")[2]))
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("mkt:v:"))
-async def cb_mkt_v(cb: CallbackQuery):
-    _, _, lid_s, p_s = cb.data.split(":")
-    lid, p = int(lid_s), int(p_s)
-    lot = next((x for x in await db.list_market() if x["market_id"] == lid), None)
-    if not lot:
-        await cb.answer("Лот исчез.", show_alert=True)
-        await render_market(cb, cb.from_user.id, p)
-        return
-    st = calc_card_stats(lot)
-    txt = (
-        f"🏷 <b>ЛОТ #{lid}</b>\n━━━━━━━━━━━━━━━━━━\n"
-        f"🃏 <b>{esc(lot['name'])}</b>{fmt_serial(lot)} {card_badges(lot)} (Ур.{lot['level']})\n"
-        f"⚔️ ATK: <b>{st['atk']}</b> | ❤️ HP: <b>{st['hp']}</b> | Класс: <b>{lot['class_type']}</b>\n"
-        f"✍️ Сигна: {get_sign_text(lot)}\n"
-        f"👤 Продавец: <b>{esc(lot['seller_name'] or 'Игрок')}</b>\n💰 Цена: <b>{lot['price']}</b>"
-    )
-    act = (
-        InlineKeyboardButton(text="❌ Снять с продажи", callback_data=f"mkt:c:{lid}:{p}")
-        if lot["seller_id"] == cb.from_user.id
-        else InlineKeyboardButton(text=f"✅ Купить ({lot['price']}💰)", callback_data=f"mkt:b:{lid}:{p}")
-    )
-    await render_view(cb, txt, InlineKeyboardMarkup(inline_keyboard=[[act], [InlineKeyboardButton(text="🔙 Назад", callback_data=f"mp:mkt:{p}")]]), photo=lot.get("photo_id") or None)
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("mkt:b:"))
-async def cb_mkt_b(cb: CallbackQuery, bot: Bot):
-    _, _, lid_s, p_s = cb.data.split(":")
-    ok, msg, lot = await db.buy_market_lot(int(lid_s), cb.from_user.id)
-    await cb.answer(msg, show_alert=True)
-    if ok and lot:
-        try:
-            await bot.send_message(lot["seller_id"], f"💰 <b>КАРТУ КУПИЛИ!</b> {esc(lot['name'])}\nЗачислено (80%): <b>+{lot['payout']} 💰</b>")
-        except Exception:
-            pass
-    await render_market(cb, cb.from_user.id, int(p_s))
-
-
-@router.callback_query(F.data.startswith("mkt:c:"))
-async def cb_mkt_c(cb: CallbackQuery):
-    _, _, lid_s, p_s = cb.data.split(":")
-    await db.cancel_market_lot(int(lid_s), cb.from_user.id)
-    await cb.answer("Снято!", show_alert=True)
-    await render_market(cb, cb.from_user.id, int(p_s))
-
-
-# ==============================================================================
-# 9. РЕЙТИНГИ
-# ==============================================================================
-
-async def render_top(target: Message | CallbackQuery, mode: str = "trophies"):
-    meta = {
-        "trophies": ("🏆 Топ по Кубкам (Ранги)", "🏆"),
-        "infections_success": ("🦠 Топ по Заражениям", "зараж."),
-        "wins": ("⚔️ Топ по Победам", "побед"),
-        "total_damage": ("💥 Топ по Урону", "урона"),
-        "coins": ("💰 Топ Богачей", "💰"),
-    }
-    title, unit = meta.get(mode, meta["trophies"])
-    med = ["🥇", "🥈", "🥉"]
-    lines = [f"<b>{title}</b>", "━━━━━━━━━━━━━━━━━━"]
-    for i, r in enumerate(await db.get_leaderboard(mode, 10), 1):
-        m = med[i - 1] if i <= 3 else f"<b>{i}.</b>"
-        extra = f" <i>({get_rank_info(int(r['val']))[1]})</i>" if mode == "trophies" else ""
-        lines.append(f"{m} {fmt_user(r)} — <b>{int(r['val'])}</b> {unit}{extra}")
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏆 Кубки", callback_data="top:trophies"), InlineKeyboardButton(text="🦠 Зараж.", callback_data="top:infections_success"), InlineKeyboardButton(text="⚔️ Победы", callback_data="top:wins")],
-        [InlineKeyboardButton(text="💥 Урон", callback_data="top:total_damage"), InlineKeyboardButton(text="💰 Монеты", callback_data="top:coins")],
-    ])
-    await render_view(target, "\n".join(lines), kb)
-
-
-@router.message(F.text == "🏆 Рейтинг")
-async def menu_top(m: Message, state: FSMContext):
-    await state.clear()
-    await render_top(m, "trophies")
-
-
-@router.callback_query(F.data.startswith("top:"))
-async def cb_top(cb: CallbackQuery):
-    await render_top(cb, cb.data.split(":")[1])
-    await cb.answer()
-
-
-# ==============================================================================
-# 10. РАСШИРЕННАЯ АДМИН-ПАНЕЛЬ
-# ==============================================================================
-
-async def render_adm_home(target: Message | CallbackQuery, uid: int):
-    p = await db.get_admin_perms(uid)
-    st = await db.get_stats()
-    maint = "🔴 ВКЛ" if GAME_SETTINGS.get("maintenance") == "1" else "🟢 ВЫКЛ"
-    l_m, l_s, c_m, c_s = get_active_events()
-    txt = (
-        f"⚙️ <b>АДМИН-ПАНЕЛЬ SKIBIDI VERSE</b>\n━━━━━━━━━━━━━━━━━━\n"
-        f"👥 Игроков: <b>{st['users']}</b> | 🃏 Карт: <b>{st['cards']}</b> | 📦 Кейсов: <b>{st['crates']}</b>\n"
-        f"🪙 Валют: <b>{st['currencies']}</b> | 🏪 Рынок: <b>{st['market']}</b> | 🛠 Техработы: <b>{maint}</b>\n"
-        f"🎉 Ивенты: 🍀x{l_m} ({l_s // 60}м) | 💰x{c_m} ({c_s // 60}м)"
-    )
-    rows = []
-    r1 = ([InlineKeyboardButton(text="🃏 Карты", callback_data="adm:cards:0")] if p.get("manage_cards") else []) + ([InlineKeyboardButton(text="📦 Крейты", callback_data="adm:crates")] if p.get("manage_crates") else [])
-    if r1:
-        rows.append(r1)
-    r2 = ([InlineKeyboardButton(text="🪙 Валюты", callback_data="adm:curs")] if p.get("manage_currencies") else []) + ([InlineKeyboardButton(text="🎉 Ивенты", callback_data="adm:events")] if p.get("manage_events") else [])
-    if r2:
-        rows.append(r2)
-    r3 = ([InlineKeyboardButton(text="🎛 Баланс", callback_data="adm:set:0")] if p.get("manage_settings") else []) + ([InlineKeyboardButton(text="🌍 Мировой Босс", callback_data="adm:wb")] if p.get("manage_bosses") else [])
-    if r3:
-        rows.append(r3)
-    r4 = ([InlineKeyboardButton(text="👥 Игроки", callback_data="adm:users")] if (p.get("manage_users") or p.get("manage_economy")) else []) + ([InlineKeyboardButton(text="📢 Рассылка", callback_data="adm:bcast")] if p.get("broadcast") else [])
-    if r4:
-        rows.append(r4)
-    if p.get("manage_admins"):
-        rows.append([InlineKeyboardButton(text="👮 Админы", callback_data="adm:adms"), InlineKeyboardButton(text="🤝 Партнёры", callback_data="adm:sgns")])
-        rows.append([InlineKeyboardButton(text=f"🛠 Техработы ({maint})", callback_data="adm:maint"), InlineKeyboardButton(text="💾 Бэкап БД", callback_data="adm:bkp")])
-        rows.append([InlineKeyboardButton(text="📋 Логи", callback_data="adm:logs")])
-    await render_view(target, txt, InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@router.message(F.text == "⚙️ Админ-панель")
-async def menu_adm(m: Message, state: FSMContext, is_admin: bool):
-    if not is_admin:
-        return
-    await state.clear()
-    await render_adm_home(m, m.from_user.id)
-
-
-@router.callback_query(F.data == "adm:home")
-async def cb_adm_home(cb: CallbackQuery, state: FSMContext):
-    if not await db.is_admin(cb.from_user.id):
-        return
-    await state.clear()
-    await render_adm_home(cb, cb.from_user.id)
-    await cb.answer()
-
-
-# --- КАРТЫ (СОЗДАНИЕ, РЕДАКТОР, УДАЛЕНИЕ) ---
-
-async def render_adm_cards(target: Message | CallbackQuery, page: int = 0):
-    cards = await db.list_cards()
-    per = 7
-    tp = max(1, (len(cards) + per - 1) // per)
-    page = max(0, min(page, tp - 1))
-    rows = [[InlineKeyboardButton(text="➕ Создать карту", callback_data="ac:new")]]
-    for c in cards[page * per : (page + 1) * per]:
-        r_ico = RARITIES.get(c["rarity"], ("", "⚪️", 1, 1.0))[1]
-        ai = "🚫ИИ" if c["hide_from_ai"] else "🤖ИИ"
-        rows.append([InlineKeyboardButton(text=f"{r_ico} #{c['id']} {c['name']} ({ai})", callback_data=f"ac:ed:{c['id']}:{page}")])
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:cards:{page - 1}"))
-    nav.append(InlineKeyboardButton(text=f"{page + 1}/{tp}", callback_data="noop"))
-    if page < tp - 1:
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm:cards:{page + 1}"))
-    rows.extend([nav, [InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")]])
-    await render_view(target, f"🃏 <b>КАРТЫ</b> ({len(cards)})", InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@router.callback_query(F.data.startswith("adm:cards:"))
-async def cb_adm_cards(cb: CallbackQuery):
-    if not await db.has_perm(cb.from_user.id, "manage_cards"):
-        await cb.answer("Нет прав!", show_alert=True)
-        return
-    await render_adm_cards(cb, int(cb.data.split(":")[2]))
-    await cb.answer()
-
-
-@router.callback_query(F.data == "ac:new")
-async def cb_ac_new(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(CardFSM.name)
-    await cb.message.answer("🃏 Введите <b>название</b> новой карты:")
-    await cb.answer()
-
-
-@router.message(CardFSM.name)
-async def fsm_ac_name(m: Message, state: FSMContext):
-    await state.update_data(name=(m.text or "").strip())
-    await state.set_state(CardFSM.faction)
-    await m.answer("🏷 Выберите фракцию:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=v, callback_data=f"acf:{k}")] for k, v in FACTIONS.items()]))
-
-
-@router.callback_query(CardFSM.faction, F.data.startswith("acf:"))
-async def fsm_ac_fac(cb: CallbackQuery, state: FSMContext):
-    fac = cb.data.split(":")[1]
-    await state.update_data(faction=fac, hide_from_ai=1 if fac in ("skibidi", "astro") else 0)
-    await state.set_state(CardFSM.rarity)
-    await render_view(cb, "🌟 Выберите редкость:", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{ico} {n} (🦠{fmt_pct(ch)}%)", callback_data=f"acr:{k}")] for k, (n, ico, _, ch) in RARITIES.items()]))
-    await cb.answer()
-
-
-@router.callback_query(CardFSM.rarity, F.data.startswith("acr:"))
-async def fsm_ac_rar(cb: CallbackQuery, state: FSMContext):
-    await state.update_data(rarity=cb.data.split(":")[1])
-    await state.set_state(CardFSM.cls)
-    await render_view(cb, "⚔️ Выберите боевой класс:", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{ico} {k}", callback_data=f"acc:{k}")] for k, (ico, _) in CARD_CLASSES.items()]))
-    await cb.answer()
-
-
-@router.callback_query(CardFSM.cls, F.data.startswith("acc:"))
-async def fsm_ac_cls(cb: CallbackQuery, state: FSMContext):
-    cls = cb.data.split(":")[1]
-    await state.update_data(class_type=cls)
-    await state.set_state(CardFSM.stats)
-    await cb.message.answer("❤️⚔️ Введите <b>HP</b> и <b>ATK</b> через пробел (например: <code>250 60</code>):")
-    await cb.answer()
-
-
-@router.message(CardFSM.stats)
-async def fsm_ac_stats(m: Message, state: FSMContext):
-    p = (m.text or "").split()
-    try:
-        hp, atk = int(p[0]), int(p[1])
-    except (ValueError, IndexError):
-        await m.answer("❌ Пример: <code>250 60</code>")
-        return
-    await state.update_data(hp=hp, atk=atk)
-    d = await state.get_data()
-    if d["class_type"] == "Booster":
-        await state.set_state(CardFSM.boost)
-        await m.answer("✨ Введите множители <b>ATK</b> и <b>HP</b> для Бустера (например: <code>1.25 1.15</code>):")
-    else:
-        await state.set_state(CardFSM.desc)
-        await m.answer("📝 Введите описание (или <code>-</code>):")
-
-
-@router.message(CardFSM.boost)
-async def fsm_ac_boost(m: Message, state: FSMContext):
-    p = (m.text or "").replace(",", ".").split()
-    try:
-        bd, bh = float(p[0]), float(p[1])
-    except (ValueError, IndexError):
-        await m.answer("❌ Пример: <code>1.25 1.15</code>")
-        return
-    await state.update_data(booster_dmg_mult=bd, booster_hp_mult=bh)
-    await state.set_state(CardFSM.desc)
-    await m.answer("📝 Введите описание (или <code>-</code>):")
-
-
-@router.message(CardFSM.desc)
-async def fsm_ac_desc(m: Message, state: FSMContext):
-    t = (m.text or "").strip()
-    await state.update_data(description="" if t == "-" else t)
-    await state.set_state(CardFSM.photo)
-    await m.answer("🖼 Отправьте фото карты (или <code>-</code>):")
-
-
-@router.message(CardFSM.photo)
-async def fsm_ac_photo(m: Message, state: FSMContext):
-    pid = m.photo[-1].file_id if m.photo else ""
-    await state.update_data(photo_id=pid)
-    d = await state.get_data()
-    cid = await db.create_card(d)
-    await db.log_admin(m.from_user.id, f"Создал карту #{cid} {d['name']}")
-    await state.clear()
-    await m.answer(f"✅ Карта <b>{esc(d['name'])}</b> (#{cid}) создана!")
-    await render_adm_card_ed(m, cid, 0)
-
-
-async def render_adm_card_ed(target: Message | CallbackQuery, cid: int, page: int):
-    c = await db.get_card(cid)
-    if not c:
-        await render_adm_cards(target, page)
-        return
-    txt = (
-        f"🛠 <b>КАРТА #{c['id']} — {esc(c['name'])}</b>\n"
-        f"Фракция: {FACTIONS.get(c['faction'])} | Редкость: <b>{c['rarity']}</b> | Класс: <b>{c['class_type']}</b>\n"
-        f"❤️ HP: <b>{c['hp']}</b> | ⚔️ ATK: <b>{c['atk']}</b> | 🤖 Враг у ИИ: <b>{'Нет' if c['hide_from_ai'] else 'Да (можно заразить)'}</b>"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Имя", callback_data=f"ac:f:{cid}:name:{page}"), InlineKeyboardButton(text="🖼 Фото", callback_data=f"ac:f:{cid}:photo_id:{page}")],
-        [InlineKeyboardButton(text="❤️ HP", callback_data=f"ac:f:{cid}:hp:{page}"), InlineKeyboardButton(text="⚔️ ATK", callback_data=f"ac:f:{cid}:atk:{page}")],
-        [InlineKeyboardButton(text="🌟 Редкость", callback_data=f"ac:f:{cid}:rarity:{page}"), InlineKeyboardButton(text="🎯 Класс", callback_data=f"ac:f:{cid}:class_type:{page}")],
-        [InlineKeyboardButton(text=f"🤖 У ИИ: {'Скрыта' if c['hide_from_ai'] else 'Видна'}", callback_data=f"ac:ai:{cid}:{page}"), InlineKeyboardButton(text="🗑 Удалить", callback_data=f"ac:del:{cid}:{page}")],
-        [InlineKeyboardButton(text="🔙 К картам", callback_data=f"adm:cards:{page}")],
-    ])
-    await render_view(target, txt, kb, photo=c.get("photo_id") or None)
-
-
-@router.callback_query(F.data.startswith("ac:ed:"))
-async def cb_ac_ed(cb: CallbackQuery):
-    _, _, cid, p = cb.data.split(":")
-    await render_adm_card_ed(cb, int(cid), int(p))
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("ac:ai:"))
-async def cb_ac_ai(cb: CallbackQuery):
-    _, _, cid, p = cb.data.split(":")
-    c = await db.get_card(int(cid))
-    await db.update_card(int(cid), hide_from_ai=0 if c["hide_from_ai"] else 1)
-    await render_adm_card_ed(cb, int(cid), int(p))
-    await cb.answer("Переключено!")
-
-
-@router.callback_query(F.data.startswith("ac:f:"))
-async def cb_ac_f(cb: CallbackQuery, state: FSMContext):
-    _, _, cid, f, p = cb.data.split(":")
-    await state.set_state(CardFSM.edit_val)
-    await state.update_data(cid=int(cid), field=f, page=int(p))
-    await cb.message.answer(f"Введите новое значение для <b>{f}</b>:")
-    await cb.answer()
-
-
-@router.message(CardFSM.edit_val)
-async def fsm_ac_f_save(m: Message, state: FSMContext):
-    d = await state.get_data()
-    await state.clear()
-    f = d["field"]
-    try:
-        if f == "photo_id":
-            val: Any = m.photo[-1].file_id if m.photo else ""
-        elif f in ("hp", "atk"):
-            val = int((m.text or "").strip())
-        elif f == "rarity":
-            val = (m.text or "").strip().lower()
-            if val not in RARITIES:
-                raise ValueError
-        elif f == "class_type":
-            val = (m.text or "").strip()
-            if val not in CARD_CLASSES:
-                raise ValueError
-        else:
-            val = (m.text or "").strip()
-    except ValueError:
-        await m.answer("❌ Неверный формат.")
-        return
-    await db.update_card(d["cid"], **{f: val})
-    await render_adm_card_ed(m, d["cid"], d["page"])
-
-
-@router.callback_query(F.data.startswith("ac:del:"))
-async def cb_ac_del(cb: CallbackQuery):
-    _, _, cid, p = cb.data.split(":")
-    await db.delete_card(int(cid))
-    await cb.answer("🗑 Удалено!", show_alert=True)
-    await render_adm_cards(cb, int(p))
-
-
-# --- КАСТОМНЫЕ ВАЛЮТЫ ---
-
-async def render_adm_curs(target: Message | CallbackQuery):
-    curs = await db.list_currencies()
-    rows = [[InlineKeyboardButton(text="➕ Создать валюту", callback_data="acu:new")]]
-    for c in curs:
-        dr = f"🎲{c['drop_chance']}% ({c['drop_min']}-{c['drop_max']})" if c["drop_in_battles"] else "🚫Без дропа"
-        rows.append([InlineKeyboardButton(text=f"🪙 {c['name']} | {dr}", callback_data=f"acu:ed:{c['id']}")])
-    rows.append([InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")])
-    await render_view(target, "🪙 <b>КАСТОМНЫЕ ВАЛЮТЫ</b>\nМожно выдавать игрокам, продавать за них кейсы и включить дроп за победы!", InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@router.callback_query(F.data == "adm:curs")
-async def cb_adm_curs(cb: CallbackQuery):
-    if not await db.has_perm(cb.from_user.id, "manage_currencies"):
-        await cb.answer("Нет прав!", show_alert=True)
-        return
-    await render_adm_curs(cb)
-    await cb.answer()
-
-
-@router.callback_query(F.data == "acu:new")
-async def cb_acu_new(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(CurFSM.name)
-    await cb.message.answer("🪙 Введите название новой валюты (например <code>💎 Астро-Кристаллы</code>):")
-    await cb.answer()
-
-
-@router.message(CurFSM.name)
-async def fsm_acu_name(m: Message, state: FSMContext):
-    await state.clear()
-    try:
-        cid = await db.create_currency((m.text or "").strip())
-        await db.log_admin(m.from_user.id, f"Создал валюту #{cid}")
-        await render_adm_curs(m)
-    except Exception:
-        await m.answer("❌ Такая валюта уже существует.")
-
-
-@router.callback_query(F.data.startswith("acu:ed:"))
-async def cb_acu_ed(cb: CallbackQuery):
-    cid = int(cb.data.split(":")[2])
-    c = await db.get_currency(cid)
-    if not c:
-        return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🎲 Дроп в боях: {'ВКЛ' if c['drop_in_battles'] else 'ВЫКЛ'}", callback_data=f"acu:tgl:{cid}")],
-        [InlineKeyboardButton(text=f"⚙️ Настроить дроп ({c['drop_chance']}% | {c['drop_min']}-{c['drop_max']})", callback_data=f"acu:cfg:{cid}")],
-        [InlineKeyboardButton(text="🗑 Удалить валюту", callback_data=f"acu:del:{cid}")],
-        [InlineKeyboardButton(text="🔙 К валютам", callback_data="adm:curs")],
-    ])
-    await render_view(cb, f"🪙 <b>Валюта: {esc(c['name'])}</b>", kb)
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("acu:tgl:"))
-async def cb_acu_tgl(cb: CallbackQuery):
-    cid = int(cb.data.split(":")[2])
-    c = await db.get_currency(cid)
-    await db.update_currency(cid, drop_in_battles=0 if c["drop_in_battles"] else 1)
-    cb.data = f"acu:ed:{cid}"
-    await cb_acu_ed(cb)
-
-
-@router.callback_query(F.data.startswith("acu:cfg:"))
-async def cb_acu_cfg(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(CurFSM.drop_cfg)
-    await state.update_data(cid=int(cb.data.split(":")[2]))
-    await cb.message.answer("🎲 Введите через пробел: <code>шанс_% мин макс</code> (например: <code>15 1 5</code>):")
-    await cb.answer()
-
-
-@router.message(CurFSM.drop_cfg)
-async def fsm_acu_cfg(m: Message, state: FSMContext):
-    cid = (await state.get_data())["cid"]
-    await state.clear()
-    p = (m.text or "").replace(",", ".").split()
-    try:
-        ch, mn, mx = float(p[0]), int(p[1]), int(p[2])
-    except (ValueError, IndexError):
-        await m.answer("❌ Пример: <code>15 1 5</code>")
-        return
-    await db.update_currency(cid, drop_chance=ch, drop_min=mn, drop_max=mx, drop_in_battles=1)
-    await render_adm_curs(m)
-
-
-@router.callback_query(F.data.startswith("acu:del:"))
-async def cb_acu_del(cb: CallbackQuery):
-    await db.delete_currency(int(cb.data.split(":")[2]))
-    await cb.answer("🗑 Удалено!", show_alert=True)
-    await render_adm_curs(cb)
-
-
-# --- КРЕЙТЫ (АДМИН) ---
-
-async def render_adm_crates(target: Message | CallbackQuery):
-    crates = await db.list_crates()
-    rows = [[InlineKeyboardButton(text="➕ Создать Кейс", callback_data="ak:new")]]
-    for c in crates:
-        rows.append([InlineKeyboardButton(text=f"{'🟢' if c['active'] else '🔴'} {c['name']} ({c['price']})", callback_data=f"ak:ed:{c['id']}")])
-    rows.append([InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")])
-    await render_view(target, f"📦 <b>КРЕЙТЫ</b> ({len(crates)})", InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@router.callback_query(F.data == "adm:crates")
-async def cb_adm_crates(cb: CallbackQuery):
-    if not await db.has_perm(cb.from_user.id, "manage_crates"):
-        await cb.answer("Нет прав!", show_alert=True)
-        return
-    await render_adm_crates(cb)
-    await cb.answer()
-
-
-@router.callback_query(F.data == "ak:new")
-async def cb_ak_new(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(CrateFSM.name)
-    await state.update_data(cards={})
-    await cb.message.answer("📦 Введите <b>название</b> кейса:")
-    await cb.answer()
-
-
-@router.message(CrateFSM.name)
-async def fsm_ak_name(m: Message, state: FSMContext):
-    await state.update_data(name=(m.text or "").strip())
-    await state.set_state(CrateFSM.curr)
-    rows = [[InlineKeyboardButton(text="💰 Монеты (Основная)", callback_data="akc:0")]]
-    for c in await db.list_currencies():
-        rows.append([InlineKeyboardButton(text=f"🪙 {c['name']}", callback_data=f"akc:{c['id']}")])
-    await m.answer("🪙 Выберите валюту для покупки этого кейса:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@router.callback_query(CrateFSM.curr, F.data.startswith("akc:"))
-async def fsm_ak_curr(cb: CallbackQuery, state: FSMContext):
-    await state.update_data(currency_id=int(cb.data.split(":")[1]))
-    await state.set_state(CrateFSM.price)
-    await cb.message.answer("💵 Введите <b>цену</b> и <b>описание</b> через `|` (например: <code>500 | Описание</code>):")
-    await cb.answer()
-
-
-@router.message(CrateFSM.price)
-async def fsm_ak_price(m: Message, state: FSMContext):
-    p = (m.text or "").split("|", 1)
-    try:
-        pr = int(p[0].strip())
-    except ValueError:
-        await m.answer("❌ Пример: <code>500 | Описание</code>")
-        return
-    await state.update_data(price=pr, desc=p[1].strip() if len(p) > 1 else "")
-    await state.set_state(CrateFSM.photo)
-    await m.answer("🖼 Отправьте фото кейса (или <code>-</code>):")
-
-
-@router.message(CrateFSM.photo)
-async def fsm_ak_photo(m: Message, state: FSMContext):
-    await state.update_data(photo_id=m.photo[-1].file_id if m.photo else "")
-    await _ak_builder(m, state)
-
-
-async def _ak_builder(target: Message | CallbackQuery, state: FSMContext):
-    d = await state.get_data()
-    cmap = d.get("cards", {})
-    all_c = await db.list_cards()
-    by_id = {str(x["id"]): x for x in all_c}
-    lines = [f"📦 <b>Состав «{esc(d['name'])}»</b>:"] + [f"• {esc(by_id[k]['name'])} — вес {w}" for k, w in cmap.items() if k in by_id]
-    rows, row = [], []
-    for c in all_c[:24]:
-        row.append(InlineKeyboardButton(text=c["name"][:14], callback_data=f"akb:c:{c['id']}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    if cmap:
-        rows.append([InlineKeyboardButton(text="💾 Сохранить Кейс", callback_data="akb:save")])
-    await state.set_state(CrateFSM.builder)
-    await render_view(target, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@router.callback_query(CrateFSM.builder, F.data.startswith("akb:c:"))
-async def cb_akb_c(cb: CallbackQuery, state: FSMContext):
-    await state.update_data(sel_c=cb.data.split(":")[2])
-    await state.set_state(CrateFSM.weight)
-    await cb.message.answer("⚖️ Введите вес выпадения (число):")
-    await cb.answer()
-
-
-@router.message(CrateFSM.weight)
-async def fsm_akb_w(m: Message, state: FSMContext):
-    try:
-        w = int((m.text or "").strip())
-    except ValueError:
-        await m.answer("❌ Введите число.")
-        return
-    d = await state.get_data()
-    cm = dict(d.get("cards", {}))
-    cm[d["sel_c"]] = w
-    await state.update_data(cards=cm)
-    await _ak_builder(m, state)
-
-
-@router.callback_query(CrateFSM.builder, F.data == "akb:save")
-async def cb_akb_save(cb: CallbackQuery, state: FSMContext):
-    d = await state.get_data()
-    await db.create_crate(d["name"], d["desc"], d["currency_id"], d["price"], d["cards"], d["photo_id"])
-    await state.clear()
-    await cb.answer("✅ Кейс создан!", show_alert=True)
-    await render_adm_crates(cb)
-
-
-@router.callback_query(F.data.startswith("ak:ed:"))
-async def cb_ak_ed(cb: CallbackQuery):
-    cid = int(cb.data.split(":")[2])
-    c = await db.get_crate(cid)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔴 Выкл" if c["active"] else "🟢 Вкл", callback_data=f"ak:tgl:{cid}"), InlineKeyboardButton(text="🗑 Удалить", callback_data=f"ak:del:{cid}")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm:crates")],
-    ])
-    await render_view(cb, f"📦 <b>{esc(c['name'])}</b> (Цена: {c['price']})", kb)
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("ak:tgl:"))
-async def cb_ak_tgl(cb: CallbackQuery):
-    cid = int(cb.data.split(":")[2])
-    c = await db.get_crate(cid)
-    await db.update_crate(cid, active=0 if c["active"] else 1)
-    await render_adm_crates(cb)
-    await cb.answer("Статус изменён!")
-
-
-@router.callback_query(F.data.startswith("ak:del:"))
-async def cb_ak_del(cb: CallbackQuery):
-    await db.delete_crate(int(cb.data.split(":")[2]))
-    await cb.answer("🗑 Удалено!", show_alert=True)
-    await render_adm_crates(cb)
-
-
-# --- ИВЕНТЫ (УДАЧА И МОНЕТЫ С РАССЫЛКОЙ) ---
-
-@router.callback_query(F.data == "adm:events")
-async def cb_adm_ev(cb: CallbackQuery):
-    if not await db.has_perm(cb.from_user.id, "manage_events"):
-        await cb.answer("Нет прав!", show_alert=True)
-        return
-    lm, ls, cm, cs = get_active_events()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🍀 Запустить Ивент Удачи", callback_data="aev:luck"), InlineKeyboardButton(text="💰 Запустить Ивент Монет", callback_data="aev:coin")],
-        [InlineKeyboardButton(text="🛑 Сбросить все ивенты", callback_data="aev:stop")],
-        [InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")],
-    ])
-    await render_view(cb, f"🎉 <b>УПРАВЛЕНИЕ ИВЕНТАМИ</b>\n🍀 Удача: <b>x{lm}</b> ({ls // 60} мин.)\n💰 Монеты: <b>x{cm}</b> ({cs // 60} мин.)", kb)
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("aev:"))
-async def cb_aev(cb: CallbackQuery, state: FSMContext):
-    act = cb.data.split(":")[1]
-    if act == "stop":
-        await db.set_setting("luck_event_end", "0")
-        await db.set_setting("coin_event_end", "0")
-        await cb.answer("🛑 Ивенты остановлены!", show_alert=True)
-        await cb_adm_ev(cb)
-        return
-    await state.set_state(AdminFSM.ev_cfg)
-    await state.update_data(ev_type=act)
-    await cb.message.answer("🎉 Введите <b>множитель</b> и <b>минуты</b> через пробел (например: <code>2.0 60</code>):")
-    await cb.answer()
-
-
-@router.message(AdminFSM.ev_cfg)
-async def fsm_aev_save(m: Message, state: FSMContext, bot: Bot):
-    ev = (await state.get_data())["ev_type"]
-    await state.clear()
-    p = (m.text or "").replace(",", ".").split()
-    try:
-        mult, mins = float(p[0]), int(p[1])
-    except (ValueError, IndexError):
-        await m.answer("❌ Пример: <code>2.0 60</code>")
-        return
-    end = int(time.time()) + mins * 60
-    if ev == "luck":
-        await db.set_setting("luck_event_mult", str(mult))
-        await db.set_setting("luck_event_end", str(end))
-        note = f"🍀 <b>ГЛОБАЛЬНЫЙ ИВЕНТ УДАЧИ x{mult}</b> на <b>{mins} мин.</b>!\nУвеличены шансы заражения, ✨ Shiny и редких карт!"
-    else:
-        await db.set_setting("coin_event_mult", str(mult))
-        await db.set_setting("coin_event_end", str(end))
-        note = f"💰 <b>ГЛОБАЛЬНЫЙ ИВЕНТ МОНЕТ x{mult}</b> на <b>{mins} мин.</b>!\nВсе награды монет за бои увеличены!"
-    await db.log_admin(m.from_user.id, f"Ивент {ev} x{mult} на {mins}м")
-    await m.answer("✅ Ивент запущен! Рассылаем уведомление...")
-    for uid in await db.get_active_uids():
-        try:
-            await bot.send_message(uid, note)
-            await asyncio.sleep(0.03)
-        except Exception:
-            pass
-
-
-# --- НАСТРОЙКИ БАЛАНСА ---
-
-async def render_adm_set(target: Message | CallbackQuery, page: int = 0):
-    keys = list(SETTING_META.keys())
-    per = 7
-    tp = max(1, (len(keys) + per - 1) // per)
-    page = max(0, min(page, tp - 1))
-    rows = [[InlineKeyboardButton(text=f"{SETTING_META[k][0]}: {GAME_SETTINGS.get(k)}", callback_data=f"as:{k}:{page}")] for k in keys[page * per : (page + 1) * per]]
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:set:{page - 1}"))
-    nav.append(InlineKeyboardButton(text=f"{page + 1}/{tp}", callback_data="noop"))
-    if page < tp - 1:
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm:set:{page + 1}"))
-    rows.extend([nav, [InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")]])
-    await render_view(target, "🎛 <b>НАСТРОЙКИ БАЛАНСА</b>", InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@router.callback_query(F.data.startswith("adm:set:"))
-async def cb_adm_set(cb: CallbackQuery):
-    if not await db.has_perm(cb.from_user.id, "manage_settings"):
-        await cb.answer("Нет прав!", show_alert=True)
-        return
-    await render_adm_set(cb, int(cb.data.split(":")[2]))
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("as:"))
-async def cb_as(cb: CallbackQuery, state: FSMContext):
-    _, k, p = cb.data.split(":")
-    await state.set_state(AdminFSM.set_val)
-    await state.update_data(k=k, p=int(p))
-    t, vt, mn, mx = SETTING_META[k]
-    await cb.message.answer(f"🎛 <b>{t}</b>\nТекущее: <code>{GAME_SETTINGS.get(k)}</code>\nНовое ({vt}, {mn}–{mx}):")
-    await cb.answer()
-
-
-@router.message(AdminFSM.set_val)
-async def fsm_as(m: Message, state: FSMContext):
-    d = await state.get_data()
-    await state.clear()
-    k = d["k"]
-    _, vt, mn, mx = SETTING_META[k]
-    try:
-        raw = (m.text or "").replace(",", ".").strip()
-        v = int(raw) if vt == "int" else float(raw)
-        if not (mn <= v <= mx):
-            raise ValueError
-    except ValueError:
-        await m.answer(f"❌ От {mn} до {mx}.")
-        return
-    await db.set_setting(k, str(v))
-    await render_adm_set(m, d["p"])
-
-
-# --- МИРОВОЙ БОСС (АДМИН) ---
-
-@router.callback_query(F.data == "adm:wb")
-async def cb_adm_wb(cb: CallbackQuery):
-    if not await db.has_perm(cb.from_user.id, "manage_bosses"):
-        await cb.answer("Нет прав!", show_alert=True)
-        return
-    wb = await db.get_world_boss()
-    bosses = [c for c in await db.list_cards() if c["rarity"] in ("legendary", "mythic", "secret")]
-    rows = ([[InlineKeyboardButton(text="🛑 Остановить Босса", callback_data="awb:stop")]] if wb else []) + [
-        [InlineKeyboardButton(text=f"🌍 {c['name']}", callback_data=f"awb:sp:{c['id']}")] for c in bosses[:10]
-    ] + [[InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")]]
-    await render_view(cb, f"🌍 <b>МИРОВОЙ БОСС</b>\n{('Активен: ' + esc(wb['name'])) if wb else 'Нет активного.'}", InlineKeyboardMarkup(inline_keyboard=rows))
-    await cb.answer()
-
-
-@router.callback_query(F.data == "awb:stop")
-async def cb_awb_stop(cb: CallbackQuery):
-    await db.stop_world_boss()
-    await cb.answer("🛑 Остановлен!", show_alert=True)
-    await cb_adm_wb(cb)
-
-
-@router.callback_query(F.data.startswith("awb:sp:"))
-async def cb_awb_sp(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminFSM.wb_hp)
-    await state.update_data(cid=int(cb.data.split(":")[2]))
-    await cb.message.answer("❤️ Введите HP Мирового Босса (например <code>25000</code>):")
-    await cb.answer()
-
-
-@router.message(AdminFSM.wb_hp)
-async def fsm_awb_hp(m: Message, state: FSMContext, bot: Bot):
-    cid = (await state.get_data())["cid"]
-    await state.clear()
-    try:
-        hp = max(100, int((m.text or "").strip()))
-    except ValueError:
-        await m.answer("❌ Число.")
-        return
-    c = await db.get_card(cid)
-    await db.spawn_world_boss(cid, hp)
-    await m.answer(f"🌍 Запущен Мировой Босс <b>{esc(c['name'])}</b> ({hp} HP)!")
-    for uid in await db.get_active_uids():
-        try:
-            await bot.send_message(uid, f"🚨🌍 <b>МИРОВОЙ БОСС: {esc(c['name'])} ({hp} HP)!</b>\nБей в «🌐 Мультиплеер → 🌍 Мировой Босс»!")
-        except Exception:
-            pass
-
-
-# --- ИГРОКИ, ВЫДАЧА, РАССЫЛКА, АДМИНЫ, ПАРТНЁРЫ, ТЕХРАБОТЫ, БД ---
-
-@router.callback_query(F.data == "adm:users")
-async def cb_adm_u(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminFSM.find_u)
-    await cb.message.answer("👥 Введите <b>@username</b> или <b>ID</b> игрока:")
-    await cb.answer()
-
-
-@router.message(AdminFSM.find_u)
-async def fsm_adm_u(m: Message, state: FSMContext):
-    await state.clear()
-    u = await db.find_user(m.text or "")
-    if not u:
-        await m.answer("❌ Игрок не найден.")
-        return
-    await render_adm_user(m, u["user_id"])
-
-
-async def render_adm_user(target: Message | CallbackQuery, tid: int):
-    u = await db.get_user(tid)
-    txt = await build_profile_text(u, False) + f"\n🚫 Бан: <b>{'ДА' if u['is_banned'] else 'НЕТ'}</b>"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 +/- Монеты", callback_data=f"au:c:{tid}"), InlineKeyboardButton(text="🪙 Выдать валюту", callback_data=f"au:cur:{tid}")],
-        [InlineKeyboardButton(text="🦠 +3 Обыч.", callback_data=f"au:p:common:{tid}"), InlineKeyboardButton(text="💎 +3 Элит.", callback_data=f"au:p:elite:{tid}")],
-        [InlineKeyboardButton(text="🎁 Выдать карту", callback_data=f"au:gc:{tid}"), InlineKeyboardButton(text="✅ Разбан" if u["is_banned"] else "🚫 Бан", callback_data=f"au:ban:{tid}")],
-        [InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")],
-    ])
-    await render_view(target, txt, kb)
-
-
-@router.callback_query(F.data.startswith("au:c:"))
-async def cb_au_c(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminFSM.u_coins)
-    await state.update_data(tid=int(cb.data.split(":")[2]))
-    await cb.message.answer("💰 Введите сумму монет (+/-):")
-    await cb.answer()
-
-
-@router.message(AdminFSM.u_coins)
-async def fsm_au_c(m: Message, state: FSMContext):
-    tid = (await state.get_data())["tid"]
-    await state.clear()
-    try:
-        await db.add_coins(tid, int((m.text or "").strip()))
-    except ValueError:
-        await m.answer("❌ Число.")
-        return
-    await render_adm_user(m, tid)
-
-
-@router.callback_query(F.data.startswith("au:cur:"))
-async def cb_au_cur(cb: CallbackQuery):
-    tid = int(cb.data.split(":")[2])
-    curs = await db.list_currencies()
-    if not curs:
-        await cb.answer("Нет кастомных валют.", show_alert=True)
-        return
-    rows = [[InlineKeyboardButton(text=c["name"], callback_data=f"au:cs:{tid}:{c['id']}")] for c in curs]
-    await render_view(cb, "Выберите валюту:", InlineKeyboardMarkup(inline_keyboard=rows))
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("au:cs:"))
-async def cb_au_cs(cb: CallbackQuery, state: FSMContext):
-    _, _, tid, cid = cb.data.split(":")
-    await state.set_state(CurFSM.give_amt)
-    await state.update_data(tid=int(tid), cid=int(cid))
-    await cb.message.answer("🪙 Введите количество валюты (+/-):")
-    await cb.answer()
-
-
-@router.message(CurFSM.give_amt)
-async def fsm_au_cs(m: Message, state: FSMContext):
-    d = await state.get_data()
-    await state.clear()
-    try:
-        await db.add_user_currency(d["tid"], d["cid"], int((m.text or "").strip()))
-    except ValueError:
-        await m.answer("❌ Число.")
-        return
-    await render_adm_user(m, d["tid"])
-
-
-@router.callback_query(F.data.startswith("au:p:"))
-async def cb_au_p(cb: CallbackQuery):
-    _, _, pk, tid = cb.data.split(":")
-    await db.add_parasite(int(tid), pk, 3)
-    await cb.answer("✅ +3 паразита!", show_alert=True)
-    await render_adm_user(cb, int(tid))
-
-
-@router.callback_query(F.data.startswith("au:ban:"))
-async def cb_au_ban(cb: CallbackQuery):
-    tid = int(cb.data.split(":")[2])
-    if tid == OWNER_ID:
-        await cb.answer("Нельзя!", show_alert=True)
-        return
-    u = await db.get_user(tid)
-    await db.update_user(tid, is_banned=0 if u["is_banned"] else 1)
-    await render_adm_user(cb, tid)
-    await cb.answer("Обновлено!")
-
-
-@router.callback_query(F.data.startswith("au:gc:"))
-async def cb_au_gc(cb: CallbackQuery):
-    tid = int(cb.data.split(":")[2])
-    rows = [[InlineKeyboardButton(text=f"#{c['id']} {c['name']}", callback_data=f"au:do:{tid}:{c['id']}")] for c in (await db.list_cards())[:20]]
-    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm:home")])
-    await render_view(cb, f"🎁 Выберите карту для <code>{tid}</code>:", InlineKeyboardMarkup(inline_keyboard=rows))
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("au:do:"))
-async def cb_au_do(cb: CallbackQuery):
-    _, _, tid, cid = cb.data.split(":")
-    _, sn = await db.give_card(int(tid), int(cid))
-    await cb.answer(f"✅ Выдано!{f' [#{sn:04d}]' if sn else ''}", show_alert=True)
-    await render_adm_user(cb, int(tid))
-
-
-@router.callback_query(F.data == "adm:bcast")
-async def cb_adm_bc(cb: CallbackQuery, state: FSMContext):
-    if not await db.has_perm(cb.from_user.id, "broadcast"):
-        await cb.answer("Нет прав!", show_alert=True)
-        return
-    await state.set_state(AdminFSM.bcast)
-    await cb.message.answer("📢 Отправьте сообщение (текст или фото) для рассылки:")
-    await cb.answer()
-
-
-@router.message(AdminFSM.bcast)
-async def fsm_adm_bc(m: Message, state: FSMContext):
-    await state.clear()
-    uids = await db.get_active_uids()
-    ok = 0
-    for uid in uids:
-        try:
-            await m.send_copy(chat_id=uid)
-            ok += 1
-            await asyncio.sleep(0.04)
-        except Exception:
-            pass
-    await m.answer(f"✅ Рассылка завершена: <b>{ok}/{len(uids)}</b>")
-
-
-async def render_adms(target: Message | CallbackQuery):
-    rows = [[InlineKeyboardButton(text="➕ Добавить админа", callback_data="aa:add")]] + [
-        [InlineKeyboardButton(text=f"👮 {a['full_name'] or a['user_id']} ({a['user_id']})", callback_data=f"aa:ed:{a['user_id']}")]
-        for a in await db.list_admins()
-    ] + [[InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")]]
-    await render_view(target, f"👮 <b>АДМИНИСТРАТОРЫ</b> (Владелец: <code>{OWNER_ID}</code>)", InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@router.callback_query(F.data == "adm:adms")
-async def cb_adm_adms(cb: CallbackQuery):
-    if not await db.has_perm(cb.from_user.id, "manage_admins"):
-        await cb.answer("Нет прав!", show_alert=True)
-        return
-    await render_adms(cb)
-    await cb.answer()
-
-
-@router.callback_query(F.data == "aa:add")
-async def cb_aa_add(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminFSM.add_adm)
-    await cb.message.answer("👮 Введите ID или @username нового админа:")
-    await cb.answer()
-
-
-@router.message(AdminFSM.add_adm)
-async def fsm_aa_add(m: Message, state: FSMContext):
-    await state.clear()
-    u = await db.find_user(m.text or "")
-    tid = u["user_id"] if u else (int(m.text.strip()) if (m.text or "").strip().isdigit() else 0)
-    if not tid or tid == OWNER_ID:
-        await m.answer("❌ Неверный ID.")
-        return
-    await db.add_admin(tid, m.from_user.id)
-    await render_adm_perms(m, tid)
-
-
-async def render_adm_perms(target: Message | CallbackQuery, tid: int):
-    perms = await db.get_admin_perms(tid)
-    rows = [[InlineKeyboardButton(text=f"{'✅' if perms.get(k) else '❌'} {v}", callback_data=f"aa:t:{tid}:{k}")] for k, v in ADMIN_PERMS.items()]
-    rows.extend([[InlineKeyboardButton(text="🗑 Снять админа", callback_data=f"aa:d:{tid}")], [InlineKeyboardButton(text="🔙 К списку", callback_data="adm:adms")]])
-    await render_view(target, f"👮 <b>Права админа <code>{tid}</code></b>", InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@router.callback_query(F.data.startswith("aa:ed:"))
-async def cb_aa_ed(cb: CallbackQuery):
-    await render_adm_perms(cb, int(cb.data.split(":")[2]))
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("aa:t:"))
-async def cb_aa_t(cb: CallbackQuery):
-    _, _, tid, k = cb.data.split(":")
-    await db.toggle_admin_perm(int(tid), k)
-    await render_adm_perms(cb, int(tid))
-    await cb.answer("Обновлено!")
-
-
-@router.callback_query(F.data.startswith("aa:d:"))
-async def cb_aa_d(cb: CallbackQuery):
-    await db.remove_admin(int(cb.data.split(":")[2]))
-    await cb.answer("🗑 Снят!", show_alert=True)
-    await render_adms(cb)
-
-
-@router.callback_query(F.data == "adm:sgns")
-async def cb_adm_sgns(cb: CallbackQuery):
-    if not await db.has_perm(cb.from_user.id, "manage_admins"):
-        await cb.answer("Нет прав!", show_alert=True)
-        return
-    rows = [[InlineKeyboardButton(text="➕ Добавить Партнёра (+5% ATK/HP)", callback_data="asg:add")]] + [
-        [InlineKeyboardButton(text=f"❌ {s['full_name'] or s['user_id']}", callback_data=f"asg:d:{s['user_id']}")] for s in await db.list_signers()
-    ] + [[InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")]]
-    await render_view(cb, "🤝 <b>ПАРТНЁРЫ-СИГНЕРЫ</b>", InlineKeyboardMarkup(inline_keyboard=rows))
-    await cb.answer()
-
-
-@router.callback_query(F.data == "asg:add")
-async def cb_asg_add(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminFSM.add_sgn)
-    await cb.message.answer("🤝 Введите ID или @username Партнёра:")
-    await cb.answer()
-
-
-@router.message(AdminFSM.add_sgn)
-async def fsm_asg_add(m: Message, state: FSMContext):
-    await state.clear()
-    u = await db.find_user(m.text or "")
-    tid = u["user_id"] if u else (int(m.text.strip()) if (m.text or "").strip().isdigit() else 0)
-    if tid:
-        await db.set_signer(tid, "partner", m.from_user.id)
-        await m.answer(f"✅ Партнёр <code>{tid}</code> добавлен!")
-
-
-@router.callback_query(F.data.startswith("asg:d:"))
-async def cb_asg_d(cb: CallbackQuery):
-    await db.remove_signer(int(cb.data.split(":")[2]))
-    await cb.answer("Снят!", show_alert=True)
-    await cb_adm_sgns(cb)
-
-
-@router.callback_query(F.data == "adm:maint")
-async def cb_adm_maint(cb: CallbackQuery):
-    if not await db.has_perm(cb.from_user.id, "manage_admins"):
-        return
-    nxt = "0" if GAME_SETTINGS.get("maintenance") == "1" else "1"
-    await db.set_setting("maintenance", nxt)
-    await cb.answer("🛠 ВКЛ" if nxt == "1" else "🟢 ВЫКЛ", show_alert=True)
-    await render_adm_home(cb, cb.from_user.id)
-
-
-@router.callback_query(F.data == "adm:logs")
-async def cb_adm_logs(cb: CallbackQuery):
-    lines = ["📋 <b>ЛОГИ АДМИНОВ</b>", "━━━━━━━━━━━━━━━━━━"] + [
-        f"• [{datetime.fromtimestamp(x['created_at']).strftime('%d.%m %H:%M')}] <b>{esc(x['full_name'] or x['admin_id'])}</b>: {esc(x['action'])}"
-        for x in await db.get_admin_logs(15)
-    ]
-    await render_view(cb, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")]]))
-    await cb.answer()
-
-
-@router.callback_query(F.data == "adm:bkp")
-async def cb_adm_bkp(cb: CallbackQuery):
-    if not await db.has_perm(cb.from_user.id, "manage_admins"):
-        return
-    await cb.message.answer_document(FSInputFile(DB_PATH), caption="💾 Бэкап БД. Для восстановления отправьте этот .db файл обратно боту.")
-    await cb.answer()
-
-
-@router.message(F.document)
-async def handle_db_restore(m: Message, bot: Bot):
-    if m.from_user.id != OWNER_ID or not m.document or not (m.document.file_name or "").endswith(".db"):
-        return
-    f = await bot.get_file(m.document.file_id)
-    await bot.download_file(f.file_path, DB_PATH)
-    await db.reload_settings()
-    await m.answer("✅ <b>База данных восстановлена!</b>")
-
-
-@router.callback_query(F.data == "noop")
-async def cb_noop(cb: CallbackQuery):
-    await cb.answer()
-
-
-# ==============================================================================
-# 11. ФОНОВЫЙ БЭКАП И ЗАПУСК БОТА
-# ==============================================================================
-
-async def auto_backup_task(bot: Bot) -> None:
-    while True:
-        await asyncio.sleep(12 * 3600)
-        try:
-            await bot.send_document(OWNER_ID, FSInputFile(DB_PATH), caption="🕒 Автобэкап БД (12ч).")
-        except Exception:
-            pass
-
-
-async def main() -> None:
-    await db.init()
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
-
-    mw = AccessMiddleware()
-    dp.message.outer_middleware(mw)
-    dp.callback_query.outer_middleware(mw)
-    dp.include_router(router)
-
-    asyncio.create_task(auto_backup_task(bot))
-    me = await bot.get_me()
-    logger.info("🚀 Бот @%s (ID: %s) запущен! Владелец: %s", me.username, me.id, OWNER_ID)
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("🛑 Бот остановлен.")
+    by_
