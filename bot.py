@@ -232,9 +232,25 @@ def cfg_int(key: str) -> int:
 
 
 def get_parasite_info(p_key: str) -> Tuple[str, str, int, int]:
-    """Возвращает (название, колонка БД, цена, +бонус к шансу %)."""
+    """Возвращает (название, колонка БД, цена, +бонус к шансу в % от числа)."""
     name, col = PARASITES_META[p_key]
     return name, col, cfg_int(f"p_{p_key}_price"), cfg_int(f"p_{p_key}_bonus")
+
+
+def calc_infect_chance(base_chance: float, bonus_pct: float = 0.0, pity_pct: float = 0.0) -> float:
+    """
+    Считает итоговый шанс заражения как процент от базового числа:
+    base_chance * (1 + (bonus_pct + pity_pct) / 100).
+    Пример: 1% + 5% = 1.05%.
+    """
+    total = float(base_chance) * (1.0 + (float(bonus_pct) + float(pity_pct)) / 100.0)
+    return min(95.0, round(total, 2))
+
+
+def fmt_pct(value: float) -> str:
+    """Красиво форматирует процент (1.05 -> '1.05', 2.00 -> '2')."""
+    s = f"{float(value):.2f}".rstrip("0").rstrip(".")
+    return s or "0"
 
 
 def xp_required_for_level(level: int) -> float:
@@ -2961,7 +2977,7 @@ async def process_td_turn(bid: int, bot: Bot, delay: float) -> None:
     await update_battle_ui(bid, bot)
 
 
-async def finish_td_battle(bid: int, bot: Bot, is_win: bool) -> None:
+sync def finish_td_battle(bid: int, bot: Bot, is_win: bool) -> None:
     b = ACTIVE_BATTLES.get(bid)
     if not b:
         return
@@ -3020,22 +3036,23 @@ async def finish_td_battle(bid: int, bot: Bot, is_win: bool) -> None:
     # ФАЗА ЗАРАЖЕНИЯ БОССА (если убит хотя бы один Босс на карте)
     if bosses_killed:
         last_boss = bosses_killed[-1]
+        base_ch = float(last_boss["infect_chance"])
+        base_str = fmt_pct(base_ch)
         for uid in player_ids:
             u = await db.get_user(uid)
             PENDING_INFECTIONS[uid] = {
                 "boss_name": last_boss["name"],
-                "base_chance": int(last_boss["infect_chance"]),
+                "base_chance": base_ch,
                 "infected_unit_id": int(last_boss["infected_unit_id"]),
             }
             kb_rows = []
             for p_key in ("common", "upgraded", "elite"):
                 p_name, p_col, _, p_bonus = get_parasite_info(p_key)
                 cnt = u[p_col]
-                # Формула пользователя: шанс_босса + бонус_паразита (+ пити)
-                total_ch = min(95, last_boss["infect_chance"] + p_bonus + u["pity_bonus"])
+                total_ch = calc_infect_chance(base_ch, p_bonus, u["pity_bonus"])
                 kb_rows.append([
                     InlineKeyboardButton(
-                        text=f"{p_name} ({cnt} шт.) — {total_ch}% ({last_boss['infect_chance']}%+{p_bonus}%)",
+                        text=f"{p_name} ({cnt} шт.) — {fmt_pct(total_ch)}% ({base_str}% +{p_bonus}%)",
                         callback_data=f"td:inf:{p_key}",
                     )
                 ])
@@ -3044,7 +3061,7 @@ async def finish_td_battle(bid: int, bot: Bot, is_win: bool) -> None:
                 f"🦠 <b>ФАЗА ЗАРАЖЕНИЯ БОССА!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"👑 Повержен: <b>{esc(last_boss['name'])}</b>\n"
-                f"Базовый шанс: <b>{last_boss['infect_chance']}%</b> | 🎯 Пити: <b>+{u['pity_bonus']}%</b>\n"
+                f"Базовый шанс: <b>{base_str}%</b> | 🎯 Пити: <b>+{u['pity_bonus']}%</b> от шанса\n"
                 f"При успехе вы получите <b>🦠 Инфектед (x{cfg_float('infected_mult')})</b> версию босса!\n\n"
                 f"👇 Выберите паразита для запуска:"
             )
@@ -3197,11 +3214,13 @@ async def cb_td_infect(callback: CallbackQuery):
     PENDING_INFECTIONS.pop(uid, None)
     await db.add_parasite(uid, p_key, -1)
 
-    # Формула: базовый шанс босса (напр. 1%) + бонус паразита (напр. 5%) + пити
-    total_chance = min(95, inf["base_chance"] + p_bonus + u["pity_bonus"])
-    roll = random.randint(1, 100)
+    # Итоговый шанс: base * (1 + (p_bonus + pity) / 100), напр. 1% + 5% = 1.05%
+    total_chance = calc_infect_chance(inf["base_chance"], p_bonus, u["pity_bonus"])
+    ch_str = fmt_pct(total_chance)
+    base_str = fmt_pct(inf["base_chance"])
+    roll = random.random() * 100.0
 
-    if roll <= total_chance:
+    if roll < total_chance:
         target_unit = await db.get_unit(inf["infected_unit_id"]) if inf["infected_unit_id"] else None
         if not target_unit:
             all_u = await db.list_units()
@@ -3218,7 +3237,7 @@ async def cb_td_infect(callback: CallbackQuery):
 
         sh_txt = f"\n✨ <b>ВЫПАЛ SHINY (+{cfg_int('shiny_bonus_pct')}%)!</b>" if shiny else ""
         text = (
-            f"🦠💥 <b>УСПЕШНОЕ ЗАРАЖЕНИЕ!</b> (Шанс {total_chance}%: {inf['base_chance']}%+{p_bonus}%)\n"
+            f"🦠💥 <b>УСПЕШНОЕ ЗАРАЖЕНИЕ!</b> (Шанс {ch_str}%: {base_str}% +{p_bonus}%)\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🎁 Получен юнит: <b>{esc(target_unit['name'])}</b>\n"
             f"🧬 Статус: <b>🦠 Инфектед (x{cfg_float('infected_mult')} урон)</b>{sh_txt}\n\n"
@@ -3231,9 +3250,9 @@ async def cb_td_infect(callback: CallbackQuery):
         await db.update_user(uid, infections_fail=u["infections_fail"] + 1, pity_bonus=new_pity)
         await render_view(
             callback,
-            f"💔 <b>ЗАРАЖЕНИЕ НЕ СРАБОТАЛО...</b> (Шанс {total_chance}%, выпало {roll})\n"
+            f"💔 <b>ЗАРАЖЕНИЕ НЕ СРАБОТАЛО...</b> (Шанс {ch_str}%, выпало {roll:.2f})\n"
             f"{esc(inf['boss_name'])} сбросил паразита!\n"
-            f"🎯 Пити заражения увеличен до <b>+{new_pity}%</b>.",
+            f"🎯 Пити заражения увеличен до <b>+{new_pity}%</b> от шанса.",
         )
         await callback.answer("Неудача, Пити вырос!")
 
@@ -3255,10 +3274,10 @@ async def render_lab_and_crates(target: Message | CallbackQuery, user_id: int):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"💰 Монеты: <b>{u['coins']}</b>\n"
         f"🦠 Паразиты: Обыч. <b>{u['p_common']}</b> | Улучш. <b>{u['p_upgraded']}</b> | Элит. <b>{u['p_elite']}</b>\n\n"
-        f"🧪 <b>Паразиты (прибавляются к шансу босса):</b>\n"
-        f"• 🦠 Обычный: <b>+{cb}%</b> ({cp}💰)\n"
-        f"• ☣️ Улучшенный: <b>+{ub}%</b> ({up}💰)\n"
-        f"• 💎 Элитный: <b>+{eb}%</b> ({ep}💰)\n\n"
+        f"🧪 <b>Паразиты (увеличивают шанс босса на % от числа, напр. 1% + 5% = 1.05%):</b>\n"
+        f"• 🦠 Обычный: <b>+{cb}%</b> к шансу ({cp}💰)\n"
+        f"• ☣️ Улучшенный: <b>+{ub}%</b> к шансу ({up}💰)\n"
+        f"• 💎 Элитный: <b>+{eb}%</b> к шансу ({ep}💰)\n\n"
         f"📦 <b>Крейты (шанс ✨Shiny: {cfg_float('shiny_chance_pct')}%):</b>"
     )
     rows = [
@@ -3520,12 +3539,13 @@ async def cb_wb_hit(callback: CallbackQuery, bot: Bot):
     if rem <= 0:
         top = await db.get_world_boss_top(wb["id"], 10)
         reward_u = await db.get_unit(wb["infected_unit_id"]) if wb.get("infected_unit_id") else None
+        wb_inf_chance = calc_infect_chance(wb["infect_chance"], 25)
         for idx, part in enumerate(top, 1):
             p_uid = part["user_id"]
             coins = int(max(150, 900 - (idx - 1) * 140) * cfg_float("event_coin_mult"))
             await db.add_coins(p_uid, coins)
             extra = ""
-            if idx <= 3 and reward_u and random.randint(1, 100) <= min(75, wb["infect_chance"] + 25):
+            if idx <= 3 and reward_u and (random.random() * 100.0) < wb_inf_chance:
                 sh = roll_shiny()
                 await db.give_unit(p_uid, reward_u["id"], is_shiny=sh, is_infected=1)
                 extra = f"\n🦠 <b>ВЫ ЗАРАЗИЛИ МИРОВОГО БОССА!</b> Получен: <b>{esc(reward_u['name'])}</b>{' ✨SHINY!' if sh else ''}"
