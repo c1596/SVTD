@@ -1,6 +1,18 @@
 """
-Skibidi Verse: Cards & Infection — Telegram RPG Bot
-Стек: Python 3.10+, aiogram 3.x, aiosqlite (автоустановка при запуске).
+Skibidi Verse: Cards & Infection — Telegram Card RPG Bot
+Стек: Python 3.10+, aiogram 3.x, aiosqlite (автоматическая установка при запуске).
+
+Возможности:
+- Статичное нижнее меню + инлайн-управление без команд
+- 4×4 бои за Скибиди-Туалетов против отрядов Альянса (без пропуска боя, кнопка «Сдаться»)
+- 31 ранг Скибиди-Туалетов (чем выше ранг, тем выше награды и шанс заражения)
+- Заражение врагов при убийстве в бою по дробной формуле (% от базового числа)
+- Уровни карт за нанесённый урон (1 урон = 0.1 XP, макс 50 ур., +0.5% к урону/ур.)
+- ✨ Shiny мутация, серийные номера [#0001] на Mythic/Secret, Админ (+10%) и Партнёр (+5%) сигны
+- Инвентарь и Индекс в стиле GGTD Cards (стаки, фильтры, Существует/Shiny/Инфектед, пересчёт от удачи)
+- Массовая покупка и крафт паразитов (x1, x3, x5, x10, x25, МАКС) + Крейты + Кастомные валюты
+- Мировой Босс, P2P-рынок (80% продавцу / 20% комиссия владельцу), Ивенты Удачи и Монет
+- Расширенная Админ-панель с гибкими правами, логами и бэкапом/восстановлением БД
 """
 
 import asyncio
@@ -21,14 +33,21 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 
 def ensure_dependencies(packages: Dict[str, str]) -> None:
+    """Проверяет и автоматически устанавливает отсутствующие библиотеки через pip."""
     missing = [
-        spec for mod, spec in packages.items() if importlib.util.find_spec(mod) is None
+        pip_spec
+        for mod_name, pip_spec in packages.items()
+        if importlib.util.find_spec(mod_name) is None
     ]
     if missing:
-        print(f"📦 Установка библиотек: {', '.join(missing)}...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
-        importlib.invalidate_caches()
-        print("✅ Готово!")
+        print(f"📦 Установка отсутствующих библиотек: {', '.join(missing)}...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+            importlib.invalidate_caches()
+            print("✅ Библиотеки успешно установлены!")
+        except Exception as exc:
+            print(f"❌ Ошибка при установке библиотек: {exc}")
+            sys.exit(1)
 
 
 ensure_dependencies({"aiogram": "aiogram>=3.0.0", "aiosqlite": "aiosqlite"})
@@ -60,21 +79,26 @@ from aiogram.types import (
 DEFAULT_BOT_TOKEN = "9149772940:AAGjZRlItcwcmWKOA9mUd_BDoj_IEkNfyzE"
 DEFAULT_OWNER_ID = 5341904332
 
-_env_tok = (os.getenv("BOT_TOKEN") or "").strip().strip('"').strip("'")
+_env_token = (os.getenv("BOT_TOKEN") or "").strip().strip('"').strip("'")
 BOT_TOKEN = (
-    _env_tok
-    if (":" in _env_tok and _env_tok.split(":", 1)[0].isdigit() and _env_tok.split(":", 1)[1] and not any(c.isspace() for c in _env_tok))
+    _env_token
+    if (
+        ":" in _env_token
+        and _env_token.split(":", 1)[0].isdigit()
+        and _env_token.split(":", 1)[1]
+        and not any(ch.isspace() for ch in _env_token)
+    )
     else DEFAULT_BOT_TOKEN
 )
-_env_own = (os.getenv("OWNER_ID") or "").strip()
-OWNER_ID = int(_env_own) if _env_own.isdigit() else DEFAULT_OWNER_ID
+_env_owner = (os.getenv("OWNER_ID") or "").strip()
+OWNER_ID = int(_env_owner) if _env_owner.isdigit() else DEFAULT_OWNER_ID
 DB_PATH = (os.getenv("DB_PATH") or "").strip() or "skibidi_cards.db"
 
 MAX_DECK_SIZE = 4
 MAX_CARD_LEVEL = 50
-XP_PER_DAMAGE = 0.1
-DMG_PCT_PER_LEVEL = 0.5
-MARKET_COMMISSION_PCT = 20
+XP_PER_DAMAGE = 0.1         # 1 урон = 0.1 XP карте
+DMG_PCT_PER_LEVEL = 0.5     # +0.5% к урону за каждый уровень свыше 1
+MARKET_COMMISSION_PCT = 20  # 20% комиссия владельцу, 80% продавцу
 DAILY_COOLDOWN = 86400
 
 DEFAULT_SETTINGS: Dict[str, str] = {
@@ -186,7 +210,7 @@ SKIBIDI_RANKS: List[Tuple[str, int, float, float, int]] = [
     ("🌌 Астро-Скибиди VII", 15000, 72.00, 10.00, 300),
 ]
 
-# Сложности: key -> (название, множ. врагов, множ. кубков/монет, сдвиг пула редкостей, +бонус заражения %)
+# Сложности: key -> (название, множ. статов ИИ, множ. кубков/монет, сдвиг редкости, +бонус зараж.%)
 DIFFICULTIES: Dict[str, Tuple[str, float, float, int, int]] = {
     "easy": ("🟢 Лёгкий", 0.8, 0.6, -1, 0),
     "med": ("🟡 Средний", 1.1, 1.0, 0, 5),
@@ -207,7 +231,7 @@ BATTLE_MODS: Dict[str, Tuple[str, float, float, int]] = {
 ADMIN_PERMS: Dict[str, str] = {
     "manage_cards": "🃏 Карты (создание/редактор/удаление)",
     "manage_crates": "📦 Крейты",
-    "manage_currencies": "🪙 Валюты и дроп из каток",
+    "manage_currencies": "🪙 Валюты и дроп из боёв",
     "manage_events": "🎉 Ивенты (Удача / Монеты)",
     "manage_settings": "🎛 Настройки баланса",
     "manage_bosses": "🌍 Мировой Босс",
@@ -395,6 +419,12 @@ class Database:
                     acquired_at INTEGER DEFAULT 0
                 );
 
+                CREATE TABLE IF NOT EXISTS user_discovered (
+                    user_id INTEGER NOT NULL,
+                    card_id INTEGER NOT NULL,
+                    PRIMARY KEY (user_id, card_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS crates (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL,
@@ -444,6 +474,8 @@ class Database:
                 );
                 """
             )
+            # Синхронизируем таблицу открытых карт из уже существующего инвентаря
+            await conn.execute("INSERT OR IGNORE INTO user_discovered (user_id, card_id) SELECT DISTINCT user_id, card_id FROM inventory")
             for k, v in DEFAULT_SETTINGS.items():
                 await conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
             await conn.commit()
@@ -467,7 +499,6 @@ class Database:
             c_cnt = (await (await conn.execute("SELECT COUNT(*) FROM cards")).fetchone())[0]
             if c_cnt == 0:
                 cards = [
-                    # Скибиди (игрок) + Альянс (враги для заражения) на все 7 редкостей
                     ("Скибиди-Пехотинец", "skibidi", "common", "Single", 115, 24, 1.0, 1.0, 1, "Стартовый боец Скибиди."),
                     ("Скибиди-Охранник", "skibidi", "common", "Splash", 130, 20, 1.0, 1.0, 1, "Крепкий передовой туалет."),
                     ("Камерамен-Рекрут", "alliance", "common", "Single", 110, 22, 1.0, 1.0, 0, "Базовый агент Альянса."),
@@ -492,10 +523,7 @@ class Database:
                 ]
                 for c in cards:
                     await conn.execute(
-                        """
-                        INSERT INTO cards (name, faction, rarity, class_type, hp, atk, booster_dmg_mult, booster_hp_mult, hide_from_ai, description)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
+                        "INSERT INTO cards (name, faction, rarity, class_type, hp, atk, booster_dmg_mult, booster_hp_mult, hide_from_ai, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         c,
                     )
                 await conn.commit()
@@ -541,6 +569,7 @@ class Database:
                         "INSERT INTO inventory (user_id, card_id, level, xp, is_shiny, is_infected, serial_number, equip_slot, acquired_at) VALUES (?, ?, 1, 0, 0, 0, 0, ?, ?)",
                         (uid, st["id"], idx, now),
                     )
+                    await conn.execute("INSERT OR IGNORE INTO user_discovered (user_id, card_id) VALUES (?, ?)", (uid, st["id"]))
                 await conn.commit()
                 row = await (await conn.execute("SELECT * FROM users WHERE user_id = ?", (uid,))).fetchone()
             elif row["username"] != uname or row["full_name"] != fname:
@@ -558,7 +587,11 @@ class Database:
         s = q.strip().lstrip("@").lower()
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
-            r = await (await conn.execute("SELECT * FROM users WHERE user_id = ?", (int(s),))).fetchone() if s.isdigit() else await (await conn.execute("SELECT * FROM users WHERE LOWER(username) = ?", (s,))).fetchone()
+            r = (
+                await (await conn.execute("SELECT * FROM users WHERE user_id = ?", (int(s),))).fetchone()
+                if s.isdigit()
+                else await (await conn.execute("SELECT * FROM users WHERE LOWER(username) = ?", (s,))).fetchone()
+            )
             return dict(r) if r else None
 
     async def update_user(self, uid: int, **kw: Any) -> None:
@@ -630,12 +663,7 @@ class Database:
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             rows = await (await conn.execute(
-                """
-                SELECT c.id, c.name, COALESCE(uc.amount, 0) AS amount
-                FROM currencies c
-                LEFT JOIN user_currencies uc ON uc.currency_id = c.id AND uc.user_id = ?
-                ORDER BY c.id ASC
-                """,
+                "SELECT c.id, c.name, COALESCE(uc.amount, 0) AS amount FROM currencies c LEFT JOIN user_currencies uc ON uc.currency_id = c.id AND uc.user_id = ? ORDER BY c.id ASC",
                 (uid,),
             )).fetchall()
             return [dict(r) for r in rows]
@@ -654,10 +682,7 @@ class Database:
             return
         async with aiosqlite.connect(self.path) as conn:
             await conn.execute(
-                """
-                INSERT INTO user_currencies (user_id, currency_id, amount) VALUES (?, ?, MAX(0, ?))
-                ON CONFLICT(user_id, currency_id) DO UPDATE SET amount = MAX(0, amount + ?)
-                """,
+                "INSERT INTO user_currencies (user_id, currency_id, amount) VALUES (?, ?, MAX(0, ?)) ON CONFLICT(user_id, currency_id) DO UPDATE SET amount = MAX(0, amount + ?)",
                 (uid, cid, delta, delta),
             )
             await conn.commit()
@@ -740,7 +765,7 @@ class Database:
             conn.row_factory = aiosqlite.Row
             return [dict(r) for r in await (await conn.execute("SELECT l.*, u.full_name FROM admin_logs l LEFT JOIN users u ON l.admin_id = u.user_id ORDER BY l.id DESC LIMIT ?", (limit,))).fetchall()]
 
-    # -------------------- Карточки --------------------
+    # -------------------- Карточки и Статистика Индекса --------------------
 
     async def list_cards(self, ai_only: bool = False) -> List[Dict[str, Any]]:
         async with aiosqlite.connect(self.path) as conn:
@@ -757,10 +782,7 @@ class Database:
     async def create_card(self, d: Dict[str, Any]) -> int:
         async with aiosqlite.connect(self.path) as conn:
             cur = await conn.execute(
-                """
-                INSERT INTO cards (name, faction, rarity, class_type, hp, atk, booster_dmg_mult, booster_hp_mult, hide_from_ai, description, photo_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                "INSERT INTO cards (name, faction, rarity, class_type, hp, atk, booster_dmg_mult, booster_hp_mult, hide_from_ai, description, photo_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     d["name"], d["faction"], d["rarity"], d["class_type"],
                     int(d["hp"]), int(d["atk"]),
@@ -783,20 +805,33 @@ class Database:
         async with aiosqlite.connect(self.path) as conn:
             await conn.execute("DELETE FROM market WHERE inv_id IN (SELECT id FROM inventory WHERE card_id = ?)", (cid,))
             await conn.execute("DELETE FROM inventory WHERE card_id = ?", (cid,))
+            await conn.execute("DELETE FROM user_discovered WHERE card_id = ?", (cid,))
             await conn.execute("DELETE FROM cards WHERE id = ?", (cid,))
             await conn.commit()
 
-    async def get_card_exist(self, cid: int) -> Tuple[int, int]:
+    async def get_card_exist_stats(self, cid: int) -> Tuple[int, int, int]:
+        """Возвращает (всего существует, ✨ Shiny, 🦠 Инфектед) у игроков (без владельца)."""
         async with aiosqlite.connect(self.path) as conn:
-            r = await (await conn.execute("SELECT COUNT(*), COALESCE(SUM(is_shiny), 0) FROM inventory WHERE card_id = ? AND user_id != ?", (cid, OWNER_ID))).fetchone()
-            return (r[0] or 0, r[1] or 0) if r else (0, 0)
+            r = await (await conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(is_shiny), 0), COALESCE(SUM(is_infected), 0) FROM inventory WHERE card_id = ? AND user_id != ?",
+                (cid, OWNER_ID),
+            )).fetchone()
+            return (r[0] or 0, r[1] or 0, r[2] or 0) if r else (0, 0, 0)
+
+    async def get_discovered_ids(self, uid: int) -> Set[int]:
+        async with aiosqlite.connect(self.path) as conn:
+            rows = await (await conn.execute(
+                "SELECT card_id FROM user_discovered WHERE user_id = ? UNION SELECT DISTINCT card_id FROM inventory WHERE user_id = ?",
+                (uid, uid),
+            )).fetchall()
+            return {r[0] for r in rows}
 
     # -------------------- Инвентарь и Серийные номера --------------------
 
     async def give_card(
         self, uid: int, card_id: int, is_shiny: int = 0, is_infected: int = 0, sign_type: str = "none", signed_by: str = ""
     ) -> Tuple[int, int]:
-        """Выдаёт карту и автоматически назначает серийник [#0001] для Mythic/Secret (обычных и Shiny раздельно)."""
+        """Выдаёт карту, отмечает в Индексе и назначает серийник [#0001] для Mythic/Secret (обычные/Shiny раздельно)."""
         card = await self.get_card(card_id)
         rarity = card["rarity"] if card else "common"
         async with aiosqlite.connect(self.path) as conn:
@@ -808,12 +843,10 @@ class Database:
                 )).fetchone()
                 serial = (row[0] or 0) + 1
             cur = await conn.execute(
-                """
-                INSERT INTO inventory (user_id, card_id, level, xp, is_shiny, is_infected, serial_number, sign_type, signed_by, equip_slot, acquired_at)
-                VALUES (?, ?, 1, 0, ?, ?, ?, ?, ?, 0, ?)
-                """,
+                "INSERT INTO inventory (user_id, card_id, level, xp, is_shiny, is_infected, serial_number, sign_type, signed_by, equip_slot, acquired_at) VALUES (?, ?, 1, 0, ?, ?, ?, ?, ?, 0, ?)",
                 (uid, card_id, is_shiny, is_infected, serial, sign_type, signed_by, int(time.time())),
             )
+            await conn.execute("INSERT OR IGNORE INTO user_discovered (user_id, card_id) VALUES (?, ?)", (uid, card_id))
             await conn.commit()
             return cur.lastrowid, serial
 
@@ -952,7 +985,7 @@ class Database:
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             lot = await (await conn.execute(
-                "SELECT m.*, c.name FROM market m JOIN inventory i ON m.inv_id = i.id JOIN cards c ON i.card_id = c.id WHERE m.id = ?",
+                "SELECT m.*, i.card_id, c.name FROM market m JOIN inventory i ON m.inv_id = i.id JOIN cards c ON i.card_id = c.id WHERE m.id = ?",
                 (market_id,),
             )).fetchone()
             if not lot:
@@ -970,6 +1003,7 @@ class Database:
             await conn.execute("UPDATE users SET coins = coins + ? WHERE user_id = ?", (payout, lot["seller_id"]))
             await conn.execute("UPDATE users SET coins = coins + ? WHERE user_id = ?", (comm, OWNER_ID))
             await conn.execute("UPDATE inventory SET user_id = ?, equip_slot = 0 WHERE id = ?", (buyer_id, lot["inv_id"]))
+            await conn.execute("INSERT OR IGNORE INTO user_discovered (user_id, card_id) VALUES (?, ?)", (buyer_id, lot["card_id"]))
             await conn.execute("DELETE FROM market WHERE id = ?", (market_id,))
             await conn.commit()
             res = dict(lot)
@@ -1051,7 +1085,7 @@ db = Database(DB_PATH)
 
 
 # ==============================================================================
-# 3. СТАТЫ КАРТ, 4v4 БОЕВОЙ ДВИЖОК И UI-ХЕЛПЕРЫ
+# 3. СТАТЫ КАРТ, 4×4 БОЕВОЙ ДВИЖОК И UI-ХЕЛПЕРЫ
 # ==============================================================================
 
 def esc(v: Any) -> str:
@@ -1094,6 +1128,11 @@ def fmt_serial(item: Dict[str, Any]) -> str:
     return f" <b>[#{sn:04d}]</b>" if sn > 0 else ""
 
 
+def fmt_rarity_badge(rarity: str) -> str:
+    r_name, r_ico, _, _ = RARITIES.get(rarity, ("Обычная", "⚪️", 1, 1.0))
+    return f"{r_ico} <b>{r_name.upper()}</b> {r_ico}"
+
+
 def get_sign_text(item: Dict[str, Any]) -> str:
     st = item.get("sign_type", "none")
     if st == "none":
@@ -1106,10 +1145,10 @@ def get_sign_text(item: Dict[str, Any]) -> str:
 
 def calc_card_stats(item: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Считает реальные боевые статы карты:
+    Считает боевые статы карты:
     - Уровень (1..50): +0.5% к урону за каждый уровень свыше 1
     - ✨ Shiny: +25% к ATK и HP
-    - 🦠 Инфектед: x1.20 к ATK и HP (настраивается)
+    - 🦠 Инфектед: x1.20 к ATK и HP
     - Сигны: Админ (+10% ATK/HP), Партнёр (+5% ATK/HP)
     """
     lvl = max(1, min(MAX_CARD_LEVEL, int(item.get("level", 1))))
@@ -1117,18 +1156,29 @@ def calc_card_stats(item: Dict[str, Any]) -> Dict[str, Any]:
     sh_mult = (1.0 + cfg_float("shiny_bonus_pct") / 100.0) if item.get("is_shiny") else 1.0
     inf_mult = cfg_float("infected_mult") if item.get("is_infected") else 1.0
     st = item.get("sign_type", "none")
-    sgn_mult = 1.0 + (cfg_float("admin_sign_pct") / 100.0 if st == "admin" else (cfg_float("partner_sign_pct") / 100.0 if st == "partner" else 0.0))
+    sgn_mult = 1.0 + (
+        cfg_float("admin_sign_pct") / 100.0
+        if st == "admin"
+        else (cfg_float("partner_sign_pct") / 100.0 if st == "partner" else 0.0)
+    )
 
     hp = max(1, int(round(item["hp"] * sh_mult * inf_mult * sgn_mult)))
     atk = max(1, int(round(item["atk"] * lvl_dmg * sh_mult * inf_mult * sgn_mult)))
     b_bonus = (1.05 if item.get("is_shiny") else 1.0) * (1.05 if item.get("is_infected") else 1.0)
     b_dmg = round(float(item.get("booster_dmg_mult", 1.15)) * b_bonus, 2)
     b_hp = round(float(item.get("booster_hp_mult", 1.15)) * b_bonus, 2)
-    return {"hp": hp, "atk": atk, "power": hp + atk * 4, "b_dmg": b_dmg, "b_hp": b_hp, "lvl_pct": round((lvl - 1) * DMG_PCT_PER_LEVEL, 1)}
+    return {
+        "hp": hp,
+        "atk": atk,
+        "power": hp + atk * 4,
+        "b_dmg": b_dmg,
+        "b_hp": b_hp,
+        "lvl_pct": round((lvl - 1) * DMG_PCT_PER_LEVEL, 1),
+    }
 
 
-def format_card_info(item: Dict[str, Any], ex_tot: int = 0, ex_sh: int = 0) -> str:
-    r_name, r_ico, _, base_inf = RARITIES.get(item["rarity"], ("Обычная", "⚪️", 1, 1.0))
+def format_card_info(item: Dict[str, Any], ex_tot: int = 0, ex_sh: int = 0, ex_inf: int = 0) -> str:
+    _, r_ico, _, base_inf = RARITIES.get(item["rarity"], ("Обычная", "⚪️", 1, 1.0))
     f_name = FACTIONS.get(item["faction"], item["faction"])
     cls = item["class_type"]
     c_ico, c_desc = CARD_CLASSES.get(cls, ("🎯", ""))
@@ -1142,11 +1192,15 @@ def format_card_info(item: Dict[str, Any], ex_tot: int = 0, ex_sh: int = 0) -> s
         if lvl >= MAX_CARD_LEVEL
         else f"⭐ Ур. <b>{lvl}/{MAX_CARD_LEVEL}</b> (<b>+{st['lvl_pct']}%</b> урон)\n   {make_bar(xp, need, 8)} {xp:.1f}/{need:.0f} XP"
     )
-    status = "🏷 На P2P-рынке" if item.get("market_id") else (f"✅ Слот #{item['equip_slot']}" if item.get("equip_slot", 0) > 0 else "📦 В инвентаре")
+    status = (
+        "🏷 На P2P-рынке"
+        if item.get("market_id")
+        else (f"✅ Слот #{item['equip_slot']}" if item.get("equip_slot", 0) > 0 else "📦 В инвентаре")
+    )
 
     lines = [
         f"{r_ico} {c_ico} <b>{esc(item['name'])}</b>{fmt_serial(item)} {card_badges(item)}",
-        f"Фракция: {f_name} | Редкость: <b>{r_name}</b>",
+        f"Фракция: {f_name} | {fmt_rarity_badge(item['rarity'])}",
         f"Класс: <b>{cls}</b> — <i>{c_desc}</i>",
         f"Статус: {status}",
         "━━━━━━━━━━━━━━━━━━",
@@ -1169,7 +1223,8 @@ def format_card_info(item: Dict[str, Any], ex_tot: int = 0, ex_sh: int = 0) -> s
         "✨ <b>МОДИФИКАТОРЫ:</b>",
         f"• Мутация: <b>{sh_t}</b> | Заражение: <b>{inf_t}</b>",
         f"• Сигна: {get_sign_text(item)}",
-        f"• 🌍 Существует: <b>{ex_tot}</b> шт. (✨ Shiny: <b>{ex_sh}</b>) | 🦠 Баз. зараж.: {fmt_pct(base_inf)}%",
+        f"• 🌍 Существует: <b>{ex_tot}</b> шт. (✨ Shiny: <b>{ex_sh}</b> | 🦠 Инф: <b>{ex_inf}</b>)",
+        f"• 🦠 Базовый шанс заразить: <b>{fmt_pct(base_inf)}%</b>",
     ])
     if item.get("description"):
         lines.append(f"\n📝 <i>{esc(item['description'])}</i>")
@@ -1177,9 +1232,9 @@ def format_card_info(item: Dict[str, Any], ex_tot: int = 0, ex_sh: int = 0) -> s
 
 
 async def generate_enemy_team(rank_idx: int, diff_key: str) -> List[Dict[str, Any]]:
-    """Подбирает команду врагов (Альянс / ИИ) под ранг игрока и выбранную сложность."""
+    """Подбирает отряд Альянса под ранг Скибиди-игрока и выбранную сложность."""
     _, d_mult, _, shift, _ = DIFFICULTIES[diff_key]
-    _, _, r_diff_mult, _, _ = (rank_idx, *SKIBIDI_RANKS[rank_idx][0:1], SKIBIDI_RANKS[rank_idx][2], SKIBIDI_RANKS[rank_idx][3], SKIBIDI_RANKS[rank_idx][4])
+    r_diff_mult = SKIBIDI_RANKS[rank_idx][2]
 
     all_ai = await db.list_cards(ai_only=True)
     if not all_ai:
@@ -1188,7 +1243,6 @@ async def generate_enemy_team(rank_idx: int, diff_key: str) -> List[Dict[str, An
     for c in all_ai:
         by_rar.setdefault(c["rarity"], []).append(c)
 
-    # 7 тиров лиг соответствуют 7 редкостям
     tier = min(6, max(0, (rank_idx // 4) + shift))
     rar_order = ["common", "uncommon", "rare", "epic", "legendary", "mythic", "secret"]
 
@@ -1198,13 +1252,7 @@ async def generate_enemy_team(rank_idx: int, diff_key: str) -> List[Dict[str, An
 
     for _ in range(4):
         r = random.random()
-        if r < 0.55:
-            pick_t = tier
-        elif r < 0.85:
-            pick_t = max(0, tier - 1)
-        else:
-            pick_t = min(6, tier + 1)
-        # Secret на высоких тирах или Crazy
+        pick_t = tier if r < 0.55 else (max(0, tier - 1) if r < 0.85 else min(6, tier + 1))
         if pick_t == 6 and diff_key != "crazy" and rank_idx < 24:
             pick_t = 5
 
@@ -1284,7 +1332,16 @@ def fmt_combat_unit(idx: int, u: Dict[str, Any]) -> str:
     return f"{idx}. {r_ico}{c_ico} <b>{esc(u['name'])}</b>{b} (⚔️{u['atk']} | ❤️{u['hp']}/{u['max_hp']}){st}"
 
 
-def render_battle_screen(title: str, p_name: str, t1: List[Dict[str, Any]], e_name: str, t2: List[Dict[str, Any]], logs: List[str], rnd: int, inf_cnt: int) -> str:
+def render_battle_screen(
+    title: str,
+    p_name: str,
+    t1: List[Dict[str, Any]],
+    e_name: str,
+    t2: List[Dict[str, Any]],
+    logs: List[str],
+    rnd: int,
+    inf_cnt: int,
+) -> str:
     p_txt = "\n".join(fmt_combat_unit(i, u) for i, u in enumerate(t1, 1))
     e_txt = "\n".join(fmt_combat_unit(i, u) for i, u in enumerate(t2, 1))
     ev = "\n".join(f"• {l}" for l in logs[-3:]) if logs else "• <i>Бой начинается...</i>"
@@ -1299,6 +1356,20 @@ def render_battle_screen(title: str, p_name: str, t1: List[Dict[str, Any]], e_na
     )
 
 
+def _try_infect_enemy(
+    enemy: Dict[str, Any],
+    infected_drops: List[Dict[str, Any]],
+    infect_bonus_pct: float,
+    luck_mult: float,
+    logs: List[str],
+) -> None:
+    base_ch = RARITIES.get(enemy["rarity"], ("", "", 1, 1.0))[3]
+    total_ch = calc_infect_chance(base_ch, infect_bonus_pct, luck_mult)
+    if (random.random() * 100.0) < total_ch:
+        infected_drops.append({"card_id": enemy["card_id"], "name": enemy["name"], "rarity": enemy["rarity"], "chance": total_ch})
+        logs.append(f"🦠💥 <b>ЗАРАЖЕНИЕ!</b> {esc(enemy['name'])} перехвачен ({fmt_pct(total_ch)}%)!")
+
+
 def perform_combat_turn(
     atk_team: List[Dict[str, Any]],
     def_team: List[Dict[str, Any]],
@@ -1310,7 +1381,6 @@ def perform_combat_turn(
     luck_mult: float,
     crit_chance: float = 0.0,
 ) -> None:
-    # Горение в начале хода атакующей стороны
     for u in atk_team:
         if u["hp"] > 0 and u["burn"] > 0:
             bd = u["burn"]
@@ -1388,21 +1458,12 @@ def perform_combat_turn(
         logs.append(f"🎯 <b>{esc(actor['name'])}</b> ➔ {esc(t['name'])} (-{base_dmg}){crit_tag}{ko}")
 
 
-def _try_infect_enemy(
-    enemy: Dict[str, Any],
-    infected_drops: List[Dict[str, Any]],
-    infect_bonus_pct: float,
-    luck_mult: float,
-    logs: List[str],
+async def render_view(
+    target: Message | CallbackQuery,
+    text: str,
+    kb: Optional[InlineKeyboardMarkup] = None,
+    photo: Optional[str] = None,
 ) -> None:
-    base_ch = RARITIES.get(enemy["rarity"], ("", "", 1, 1.0))[3]
-    total_ch = calc_infect_chance(base_ch, infect_bonus_pct, luck_mult)
-    if (random.random() * 100.0) < total_ch:
-        infected_drops.append({"card_id": enemy["card_id"], "name": enemy["name"], "rarity": enemy["rarity"], "chance": total_ch})
-        logs.append(f"🦠💥 <b>ЗАРАЖЕНИЕ!</b> {esc(enemy['name'])} перехвачен ({fmt_pct(total_ch)}%)!")
-
-
-async def render_view(target: Message | CallbackQuery, text: str, kb: Optional[InlineKeyboardMarkup] = None, photo: Optional[str] = None) -> None:
     if isinstance(target, Message):
         if photo:
             try:
@@ -1445,13 +1506,19 @@ async def render_view(target: Message | CallbackQuery, text: str, kb: Optional[I
 
 def main_reply_kb(is_admin: bool = False) -> ReplyKeyboardMarkup:
     rows = [
-        [KeyboardButton(text="⚔️ В бой (Альянс)"), KeyboardButton(text="🃏 Колода и Карты")],
+        [KeyboardButton(text="⚔️ В бой (Альянс)"), KeyboardButton(text="🛡 Колода")],
+        [KeyboardButton(text="🎒 Инвентарь"), KeyboardButton(text="📖 Индекс")],
         [KeyboardButton(text="📦 Крейты и Лаба"), KeyboardButton(text="🌐 Мультиплеер")],
         [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🏆 Рейтинг")],
     ]
     if is_admin:
         rows.append([KeyboardButton(text="⚙️ Админ-панель")])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True, input_field_placeholder="Меню Скибиди-Туалетов...")
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Меню Скибиди-Туалетов...",
+    )
 
 
 class AccessMiddleware(BaseMiddleware):
@@ -1467,7 +1534,7 @@ class AccessMiddleware(BaseMiddleware):
             is_adm = await db.is_admin(tg_user.id)
             if user["is_banned"] and not is_adm:
                 if isinstance(event, Message):
-                    await event.answer("🚫 Вы заблокированы.")
+                    await event.answer("🚫 Ваш аккаунт заблокирован.")
                 elif isinstance(event, CallbackQuery):
                     await event.answer("🚫 Вы заблокированы.", show_alert=True)
                 return
@@ -1510,7 +1577,6 @@ class CrateFSM(StatesGroup):
     photo = State()
     builder = State()
     weight = State()
-    edit_val = State()
 
 
 class CurFSM(StatesGroup):
@@ -1531,7 +1597,7 @@ class AdminFSM(StatesGroup):
 
 
 # ==============================================================================
-# 5. ОСНОВНОЙ РОУТЕР: СТАРТ, ПРОФИЛЬ, МОДЫ, ЭКИПИРОВКА 2.0, ИНФО
+# 5. ОСНОВНОЙ РОУТЕР: СТАРТ, ПРОФИЛЬ, МОДЫ, КОЛОДА, ИНВЕНТАРЬ И ИНДЕКС (GGTD STYLE)
 # ==============================================================================
 
 router = Router()
@@ -1687,7 +1753,7 @@ async def cb_mod_toggle(cb: CallbackQuery):
     await cb.answer()
 
 
-# -------------------- ЭКИПИРОВКА 2.0 + ИНВЕНТАРЬ + ИНФО О КАРТЕ --------------------
+# -------------------- КОЛОДА (ЭКИПИРОВКА 2.0) --------------------
 
 async def render_deck(target: Message | CallbackQuery, uid: int):
     inv = await db.get_inventory(uid)
@@ -1702,7 +1768,11 @@ async def render_deck(target: Message | CallbackQuery, uid: int):
             st = calc_card_stats(c)
             r_ico = RARITIES.get(c["rarity"], ("", "⚪️", 1, 1.0))[1]
             c_ico = CARD_CLASSES.get(c["class_type"], ("🎯", ""))[0]
-            stat = f"✨x{st['b_dmg']}/x{st['b_hp']}" if c["class_type"] == "Booster" else (f"💗{st['atk']} ❤️{st['hp']}" if c["class_type"] == "Healer" else f"⚔️{st['atk']} ❤️{st['hp']}")
+            stat = (
+                f"✨x{st['b_dmg']}/x{st['b_hp']}"
+                if c["class_type"] == "Booster"
+                else (f"💗{st['atk']} ❤️{st['hp']}" if c["class_type"] == "Healer" else f"⚔️{st['atk']} ❤️{st['hp']}")
+            )
             lines.append(f"{nums[s - 1]} {r_ico}{c_ico} <b>{esc(c['name'])}</b>{fmt_serial(c)}{card_badges(c)} Ур.{c['level']} [{stat}]")
             s_btns.append(InlineKeyboardButton(text=f"{nums[s - 1]} {c['name'][:12]}", callback_data=f"eq:slot:{s}:0"))
         else:
@@ -1712,7 +1782,7 @@ async def render_deck(target: Message | CallbackQuery, uid: int):
     rows = [
         s_btns[:2], s_btns[2:],
         [InlineKeyboardButton(text="⚡ Авто-колода", callback_data="eq:auto"), InlineKeyboardButton(text="❌ Снять всех", callback_data="eq:clear")],
-        [InlineKeyboardButton(text=f"🎒 Инвентарь ({len(inv)})", callback_data="inv:all:0"), InlineKeyboardButton(text="📖 Энциклопедия", callback_data="enc:0")],
+        [InlineKeyboardButton(text=f"🎒 Инвентарь ({len(inv)})", callback_data="inv:all:0"), InlineKeyboardButton(text="📖 Индекс", callback_data="idx:0")],
     ]
     await render_view(target, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -1744,8 +1814,12 @@ async def render_slot_picker(target: Message | CallbackQuery, uid: int, slot: in
     await render_view(target, txt, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
+# -------------------- ИНВЕНТАРЬ (В СТИЛЕ GGTD CARDS) --------------------
+
 async def render_inventory(target: Message | CallbackQuery, uid: int, flt: str = "all", page: int = 0):
+    u = await db.get_user(uid)
     inv = await db.get_inventory(uid)
+
     if flt == "sh":
         fl = [c for c in inv if c["is_shiny"]]
     elif flt == "inf":
@@ -1755,14 +1829,14 @@ async def render_inventory(target: Message | CallbackQuery, uid: int, flt: str =
     else:
         fl = inv
 
-    # Группируем обычные дубликаты (без серийника, не в колоде, не на рынке)
+    # Группировка дубликатов (стаки), сохраняя уникальные с серийником, подписью, в колоде или на рынке отдельно
     stacks: List[Tuple[Dict[str, Any], int]] = []
     seen: Dict[Tuple, int] = {}
     for c in fl:
-        if c["equip_slot"] > 0 or c.get("market_id") or c["serial_number"] > 0:
+        if c["equip_slot"] > 0 or c.get("market_id") or c["serial_number"] > 0 or c["sign_type"] != "none":
             stacks.append((c, 1))
             continue
-        k = (c["card_id"], c["is_shiny"], c["is_infected"], c["sign_type"], c["level"])
+        k = (c["card_id"], c["is_shiny"], c["is_infected"], c["level"])
         if k in seen:
             idx = seen[k]
             stacks[idx] = (stacks[idx][0], stacks[idx][1] + 1)
@@ -1770,40 +1844,87 @@ async def render_inventory(target: Message | CallbackQuery, uid: int, flt: str =
             seen[k] = len(stacks)
             stacks.append((c, 1))
 
-    stacks.sort(key=lambda x: (1 if x[0]["equip_slot"] > 0 else 0, RARITIES.get(x[0]["rarity"], ("", "", 0, 0))[2], x[0]["is_shiny"], x[0]["is_infected"], x[0]["level"]), reverse=True)
-    per = 7
+    # Сортировка как в GGTD Cards: подписанные -> редкость -> Shiny -> Инфектед -> уровень -> ID
+    stacks.sort(
+        key=lambda x: (
+            1 if x[0]["sign_type"] != "none" else 0,
+            RARITIES.get(x[0]["rarity"], ("", "", 0, 0))[2],
+            x[0]["is_shiny"],
+            x[0]["is_infected"],
+            x[0]["level"],
+            x[0]["card_id"],
+        ),
+        reverse=True,
+    )
+
+    per = 10
     tp = max(1, (len(stacks) + per - 1) // per)
     page = max(0, min(page, tp - 1))
+    chunk = stacks[page * per : (page + 1) * per]
 
-    rows = [[
+    unique_cnt = len({c["card_id"] for c in inv})
+    shiny_cnt = sum(1 for c in inv if c["is_shiny"])
+    inf_cnt = sum(1 for c in inv if c["is_infected"])
+    flt_names = {"all": "Все", "sh": "✨ Shiny", "inf": "🦠 Заражённые", "eq": "✅ В колоде"}
+
+    lines = [
+        f"🎒 <b>ИНВЕНТАРЬ КАРТ — {flt_names.get(flt, 'Все')} (Стр. {page + 1}/{tp})</b>",
+        f"🃏 Всего: <b>{len(inv)}</b> (Уник: {unique_cnt} | ✨{shiny_cnt} | 🦠{inf_cnt})",
+        f"🦠 Паразиты: 🦠<b>{u['p_common']}</b> | ☣️<b>{u['p_upgraded']}</b> | 💎<b>{u['p_elite']}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if not chunk:
+        lines.append("<i>В этом разделе пока пусто.</i>")
+    else:
+        for idx, (c, qty) in enumerate(chunk, page * per + 1):
+            r_ico = RARITIES.get(c["rarity"], ("", "⚪️", 1, 1.0))[1]
+            c_ico = CARD_CLASSES.get(c["class_type"], ("🎯", ""))[0]
+            tag = f"✅#{c['equip_slot']} " if c["equip_slot"] > 0 else ("🏷 " if c.get("market_id") else "")
+            b = card_badges(c)
+            sn = fmt_serial(c)
+            sgn_str = f" <i>(✍️ {esc(c['signed_by'])})</i>" if c["sign_type"] != "none" and c.get("signed_by") else ""
+            lines.append(f"{idx}. {tag}{r_ico}{c_ico} <b>{esc(c['name'])}</b>{sn}{b}{sgn_str} [Ур.{c['level']}] — <b>{qty} шт.</b>")
+
+    lines.append("\n👇 <i>Нажмите на номер карты ниже, чтобы открыть Инфо, надеть или продать:</i>")
+
+    rows: List[List[InlineKeyboardButton]] = [[
         InlineKeyboardButton(text="• Все •" if flt == "all" else "Все", callback_data="inv:all:0"),
         InlineKeyboardButton(text="• ✨ •" if flt == "sh" else "✨ Shiny", callback_data="inv:sh:0"),
         InlineKeyboardButton(text="• 🦠 •" if flt == "inf" else "🦠 Зар.", callback_data="inv:inf:0"),
         InlineKeyboardButton(text="• ✅ •" if flt == "eq" else "✅ Колода", callback_data="inv:eq:0"),
     ]]
-    for c, qty in stacks[page * per : (page + 1) * per]:
+
+    btn_row: List[InlineKeyboardButton] = []
+    for idx, (c, _) in enumerate(chunk, page * per + 1):
         r_ico = RARITIES.get(c["rarity"], ("", "⚪️", 1, 1.0))[1]
-        tag = f"✅#{c['equip_slot']} " if c["equip_slot"] > 0 else ("🏷 " if c.get("market_id") else "")
-        sn = f" [#{c['serial_number']:04d}]" if c["serial_number"] else ""
-        q = f" x{qty}" if qty > 1 else ""
-        rows.append([InlineKeyboardButton(text=f"{tag}{r_ico}{card_badges(c)} {c['name']}{sn} (Ур.{c['level']}){q}", callback_data=f"c:v:{c['inv_id']}:{flt}:{page}")])
+        btn_row.append(InlineKeyboardButton(text=f"{idx}. {r_ico} {c['name'][:11]}", callback_data=f"c:v:{c['inv_id']}:{flt}:{page}"))
+        if len(btn_row) == 2:
+            rows.append(btn_row)
+            btn_row = []
+    if btn_row:
+        rows.append(btn_row)
+
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"inv:{flt}:{page - 1}"))
     nav.append(InlineKeyboardButton(text=f"{page + 1}/{tp}", callback_data="noop"))
     if page < tp - 1:
         nav.append(InlineKeyboardButton(text="➡️", callback_data=f"inv:{flt}:{page + 1}"))
-    rows.extend([nav, [InlineKeyboardButton(text="🛡 К колоде", callback_data="eq:home")]])
-    await render_view(target, f"🎒 <b>ИНВЕНТАРЬ КАРТ</b> (Всего: {len(inv)})", InlineKeyboardMarkup(inline_keyboard=rows))
+    rows.append(nav)
+    rows.append([
+        InlineKeyboardButton(text="🛡 Экипировка", callback_data="eq:home"),
+        InlineKeyboardButton(text="📖 Индекс", callback_data="idx:0"),
+    ])
+    await render_view(target, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 async def render_card_view(target: Message | CallbackQuery, uid: int, inv_id: int, flt: str, page: int):
     item = await db.get_inv_item(inv_id)
     if not item or item["user_id"] != uid:
-        await render_deck(target, uid)
+        await render_inventory(target, uid, "all", 0)
         return
-    ex_t, ex_s = await db.get_card_exist(item["card_id"])
-    txt = format_card_info(item, ex_t, ex_s)
+    ex_t, ex_s, ex_i = await db.get_card_exist_stats(item["card_id"])
+    txt = format_card_info(item, ex_t, ex_s, ex_i)
     inv = await db.get_inventory(uid)
     used = {c["equip_slot"] for c in inv if c["equip_slot"] > 0}
     free = next((s for s in range(1, MAX_DECK_SIZE + 1) if s not in used), None)
@@ -1827,36 +1948,123 @@ async def render_card_view(target: Message | CallbackQuery, uid: int, inv_id: in
     await render_view(target, txt, InlineKeyboardMarkup(inline_keyboard=rows), photo=item.get("photo_id") or None)
 
 
-async def render_encyclopedia(target: Message | CallbackQuery, uid: int, page: int = 0):
-    cards = await db.list_cards()
-    owned = {c["card_id"] for c in await db.get_inventory(uid)}
-    cards.sort(key=lambda x: RARITIES.get(x["rarity"], ("", "", 0, 0))[2], reverse=True)
-    per = 7
-    tp = max(1, (len(cards) + per - 1) // per)
-    page = max(0, min(page, tp - 1))
+# -------------------- ИНДЕКС КАРТ (В СТИЛЕ GGTD CARDS) --------------------
 
-    lines = [f"📖 <b>ЭНЦИКЛОПЕДИЯ</b> (Открыто {len(owned)}/{len(cards)})", "━━━━━━━━━━━━━━━━━━"]
-    for c in cards[page * per : (page + 1) * per]:
-        ex_t, ex_s = await db.get_card_exist(c["id"])
-        _, r_ico, _, b_inf = RARITIES.get(c["rarity"], ("", "⚪️", 1, 1.0))
-        if c["id"] in owned:
-            c_ico = CARD_CLASSES.get(c["class_type"], ("🎯", ""))[0]
-            lines.append(f"✅ {r_ico}{c_ico} <b>{esc(c['name'])}</b> (⚔️{c['atk']} ❤️{c['hp']} | 🌍{ex_t} ✨{ex_s} | 🦠{fmt_pct(b_inf)}%)")
+async def render_index(target: Message | CallbackQuery, uid: int, page: int = 0):
+    all_cards = await db.list_cards()
+    discovered = await db.get_discovered_ids(uid)
+    u = await db.get_user(uid)
+    _, _, _, _, r_inf = get_rank_info(u["trophies"])
+    l_mult, _, _, _ = get_active_events()
+
+    # Собираем, из каких крейтов выпадает каждая карта и её реальный шанс в крейте
+    crates = await db.list_crates(active_only=True)
+    crate_sources: Dict[int, List[str]] = {}
+    for cr in crates:
+        w_map = cr["cards"]
+        tot_w = 0.0
+        eff_w: Dict[int, float] = {}
+        by_id = {c["id"]: c for c in all_cards}
+        for k, v in w_map.items():
+            cid = int(k)
+            if cid in by_id and float(v) > 0:
+                fw = float(v) * (l_mult if by_id[cid]["rarity"] in ("epic", "legendary", "mythic", "secret") else 1.0)
+                eff_w[cid] = fw
+                tot_w += fw
+        if tot_w > 0:
+            for cid, fw in eff_w.items():
+                pct = (fw / tot_w) * 100.0
+                crate_sources.setdefault(cid, []).append(f"{cr['name']} ({pct:.2f}%)")
+
+    # Сортировка как в GGTD Cards: от самых редких (Secret -> Mythic -> ... -> Common)
+    all_cards.sort(key=lambda c: (RARITIES.get(c["rarity"], ("", "", 0, 0))[2], c["id"]), reverse=True)
+
+    per = 6
+    tp = max(1, (len(all_cards) + per - 1) // per)
+    page = max(0, min(page, tp - 1))
+    chunk = all_cards[page * per : (page + 1) * per]
+
+    lines = [
+        f"📖 <b>ИНДЕКС КАРТ (Стр. {page + 1}/{tp})</b>",
+        f"🧩 Открыто: <b>{len(discovered)}/{len(all_cards)}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if l_mult > 1.0:
+        lines.append(f"🍀 <b>УДАЧА ПОВЫШЕНА (x{l_mult:.2f})! Шансы пересчитаны!</b>\n")
+
+    for i, c in enumerate(chunk, page * per + 1):
+        ex_tot, ex_sh, ex_inf = await db.get_card_exist_stats(c["id"])
+        r_badge = fmt_rarity_badge(c["rarity"])
+        c_ico = CARD_CLASSES.get(c["class_type"], ("🎯", ""))[0]
+        base_inf = RARITIES.get(c["rarity"], ("", "", 1, 1.0))[3]
+        eff_inf = calc_infect_chance(base_inf, r_inf, l_mult)
+
+        src_parts = []
+        if not c["hide_from_ai"]:
+            src_parts.append(f"🦠 Зараж.: {fmt_pct(eff_inf)}%")
+        if c["id"] in crate_sources:
+            src_parts.append("📦 " + ", ".join(crate_sources[c["id"]][:2]))
+        src_str = " | ".join(src_parts) if src_parts else "Эксклюзив"
+
+        sub_exist = []
+        if ex_sh > 0:
+            sub_exist.append(f"✨ Shiny: {ex_sh}")
+        if ex_inf > 0:
+            sub_exist.append(f"🦠 Инф: {ex_inf}")
+        sub_line = f"\n   └ <i>Из них: {', '.join(sub_exist)}</i>" if sub_exist else ""
+
+        if c["id"] in discovered:
+            if c["class_type"] == "Booster":
+                stat_line = f"✨ Бафф: ATK x{c['booster_dmg_mult']} // HP x{c['booster_hp_mult']}"
+            elif c["class_type"] == "Healer":
+                stat_line = f"💗 Лечение: {c['atk']} // ❤️ Здоровье: {c['hp']}"
+            else:
+                stat_line = f"⚔️ Урон: {c['atk']} // ❤️ Здоровье: {c['hp']}"
+            lines.append(
+                f"{i}. {c_ico} <b>{esc(c['name'])}</b>\n"
+                f"   └ 💎 {r_badge}\n"
+                f"   └ 🎯 {src_str}\n"
+                f"   └ {stat_line}\n"
+                f"   └ 🌍 Существует: <b>{ex_tot} шт.</b>{sub_line}\n"
+            )
         else:
-            lines.append(f"❓ {r_ico} <b>???</b> (🌍{ex_t} ✨{ex_s} | 🦠{fmt_pct(b_inf)}%)")
+            lines.append(
+                f"{i}. <b>???</b> <i>(Не открыто)</i>\n"
+                f"   └ 💎 {r_badge}\n"
+                f"   └ 🎯 {src_str}\n"
+                f"   └ 🌍 Существует: <b>{ex_tot} шт.</b>{sub_line}\n"
+            )
+
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"enc:{page - 1}"))
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"idx:{page - 1}"))
     nav.append(InlineKeyboardButton(text=f"{page + 1}/{tp}", callback_data="noop"))
     if page < tp - 1:
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"enc:{page + 1}"))
-    await render_view(target, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=[nav, [InlineKeyboardButton(text="🔙 К колоде", callback_data="eq:home")]]))
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"idx:{page + 1}"))
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        nav,
+        [InlineKeyboardButton(text="🎒 Инвентарь", callback_data="inv:all:0"), InlineKeyboardButton(text="🛡 Колода", callback_data="eq:home")],
+    ])
+    await render_view(target, "\n".join(lines), kb)
 
 
-@router.message(F.text == "🃏 Колода и Карты")
+@router.message(F.text == "🛡 Колода")
 async def menu_deck(m: Message, state: FSMContext):
     await state.clear()
     await render_deck(m, m.from_user.id)
+
+
+@router.message(F.text == "🎒 Инвентарь")
+async def menu_inv(m: Message, state: FSMContext):
+    await state.clear()
+    await render_inventory(m, m.from_user.id, "all", 0)
+
+
+@router.message(F.text == "📖 Индекс")
+async def menu_idx(m: Message, state: FSMContext):
+    await state.clear()
+    await render_index(m, m.from_user.id, 0)
 
 
 @router.callback_query(F.data == "eq:home")
@@ -1890,7 +2098,7 @@ async def cb_eq_un(cb: CallbackQuery):
 @router.callback_query(F.data == "eq:clear")
 async def cb_eq_clear(cb: CallbackQuery):
     await db.clear_equip(cb.from_user.id)
-    await cb.answer("❌ Очищено!")
+    await cb.answer("❌ Колода очищена!")
     await render_deck(cb, cb.from_user.id)
 
 
@@ -1925,9 +2133,9 @@ async def cb_inv(cb: CallbackQuery):
     await cb.answer()
 
 
-@router.callback_query(F.data.startswith("enc:"))
-async def cb_enc(cb: CallbackQuery):
-    await render_encyclopedia(cb, cb.from_user.id, int(cb.data.split(":")[1]))
+@router.callback_query(F.data.startswith("idx:"))
+async def cb_idx(cb: CallbackQuery):
+    await render_index(cb, cb.from_user.id, int(cb.data.split(":")[1]))
     await cb.answer()
 
 
@@ -2003,7 +2211,7 @@ async def fsm_sell(m: Message, state: FSMContext):
 
 
 # ==============================================================================
-# 6. БОИ 4×4 ПРОТИВ АЛЬЯНСА, ПАРАЗИТЫ И ЗАРАЖЕНИЕ ПРИ УБИЙСТВЕ
+# 6. БОИ 4×4 ПРОТИВ АЛЬЯНСА (БЕЗ ПРОПУСКА БОЯ!) И ЗАРАЖЕНИЕ ПРИ УБИЙСТВЕ
 # ==============================================================================
 
 async def render_battle_hub(target: Message | CallbackQuery, uid: int):
@@ -2048,12 +2256,6 @@ async def menu_battle(m: Message, state: FSMContext):
     await render_battle_hub(m, m.from_user.id)
 
 
-@router.message(F.text == "⚔️ В бой (Альянс)")
-async def menu_battle(m: Message, state: FSMContext):
-    await state.clear()
-    await render_battle_hub(m, m.from_user.id)
-
-
 @router.callback_query(F.data == "btl:hub")
 async def cb_btl_hub(cb: CallbackQuery):
     await render_battle_hub(cb, cb.from_user.id)
@@ -2076,7 +2278,11 @@ async def cb_btl_par(cb: CallbackQuery):
         mark = "✅ " if armed == k else ""
         rows.append([InlineKeyboardButton(text=f"{mark}{name} (+{bon}%) — {u[col]} шт.", callback_data=f"btl:sp:{k}")])
     rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="btl:hub")])
-    await render_view(cb, "🦠 <b>ВЫБОР ПАРАЗИТА НА БОЙ</b>\n1 паразит тратится при запуске боя и усиливает шанс заражения всех 4 врагов.", InlineKeyboardMarkup(inline_keyboard=rows))
+    await render_view(
+        cb,
+        "🦠 <b>ВЫБОР ПАРАЗИТА НА БОЙ</b>\n1 паразит тратится при старте боя и усиливает шанс заражения всех 4 врагов.",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
     await cb.answer()
 
 
@@ -2092,17 +2298,6 @@ async def cb_btl_sp(cb: CallbackQuery):
     await db.update_user(uid, armed_parasite=p_key)
     await cb.answer("✅ Паразит выбран!")
     await render_battle_hub(cb, uid)
-
-
-@router.callback_query(F.data.startswith("btl:skip:"))
-async def cb_btl_skip(cb: CallbackQuery):
-    bid = cb.data.split(":")[2]
-    st = ACTIVE_BATTLES.get(bid)
-    if not st or cb.from_user.id != st["uid"]:
-        await cb.answer("Бой уже завершён.")
-        return
-    st["skip"] = True
-    await cb.answer("⏩ Перематываем к итогам...")
 
 
 @router.callback_query(F.data.startswith("btl:surr:"))
@@ -2124,7 +2319,7 @@ async def cb_btl_go(cb: CallbackQuery):
         return
     deck = await db.get_inventory(uid, only_equipped=True)
     if not deck:
-        await cb.answer("Сначала наденьте карты в «🃏 Колода и Карты»!", show_alert=True)
+        await cb.answer("Сначала наденьте карты в «🛡 Колода»!", show_alert=True)
         return
     diff_key = cb.data.split(":")[2]
     if diff_key not in DIFFICULTIES:
@@ -2149,7 +2344,7 @@ async def safe_edit_btl(msg: Message, text: str, kb: Optional[InlineKeyboardMark
 
 async def run_4v4_battle_task(origin: Message, uid: int, diff_key: str, deck: List[Dict[str, Any]]) -> None:
     bid = uuid.uuid4().hex[:10]
-    ACTIVE_BATTLES[bid] = {"uid": uid, "skip": False, "surrendered": False}
+    ACTIVE_BATTLES[bid] = {"uid": uid, "surrendered": False}
     try:
         u = await db.get_user(uid)
         r_idx, r_name, _, r_rew, r_inf = get_rank_info(u["trophies"])
@@ -2192,10 +2387,8 @@ async def run_4v4_battle_task(origin: Message, uid: int, diff_key: str, deck: Li
         apply_boosters_team(t2, f"Альянс ({diff_name})", logs)
 
         title = f"⚔️ {diff_name} | {r_name}"
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="⏩ Пропустить", callback_data=f"btl:skip:{bid}"),
-            InlineKeyboardButton(text="🏳️ Сдаться", callback_data=f"btl:surr:{bid}"),
-        ]])
+        # Пропуск боя убран — оставлена только кнопка «Сдаться»
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏳️ Сдаться", callback_data=f"btl:surr:{bid}")]])
         msg = await origin.answer(render_battle_screen(title, u["full_name"], t1, f"Отряд ({diff_name})", t2, logs, 0, 0), reply_markup=kb)
 
         delay = cfg_float("battle_delay_sec")
@@ -2223,13 +2416,12 @@ async def run_4v4_battle_task(origin: Message, uid: int, diff_key: str, deck: Li
                             e["hp"] = min(e["max_hp"], e["hp"] + max(2, int(e["max_hp"] * 0.05)))
                 perform_combat_turn(t2, t1, False, logs, dmg_tracker, infected_drops, infect_bonus_pct, l_mult)
 
-            if not st["skip"]:
-                await safe_edit_btl(msg, render_battle_screen(title, u["full_name"], t1, f"Отряд ({diff_name})", t2, logs, rnd, len(infected_drops)), kb)
-                ticks = max(1, int(delay / 0.2))
-                for _ in range(ticks):
-                    if st["skip"] or st["surrendered"]:
-                        break
-                    await asyncio.sleep(0.2)
+            await safe_edit_btl(msg, render_battle_screen(title, u["full_name"], t1, f"Отряд ({diff_name})", t2, logs, rnd, len(infected_drops)), kb)
+            ticks = max(1, int(delay / 0.2))
+            for _ in range(ticks):
+                if st["surrendered"]:
+                    break
+                await asyncio.sleep(0.2)
 
         if winner == 0:
             r1 = sum(x["hp"] for x in t1) / max(1, sum(x["max_hp"] for x in t1))
@@ -2258,7 +2450,6 @@ async def run_4v4_battle_task(origin: Message, uid: int, diff_key: str, deck: Li
             await db.add_coins(uid, coins_won)
             await db.add_trophies(uid, tr_won)
 
-            # Кастомные валюты с включённым дропом
             cur_drops = []
             for cur in await db.list_currencies():
                 if cur["drop_in_battles"] and (random.random() * 100.0) < (cur["drop_chance"] * l_mult):
@@ -2266,7 +2457,6 @@ async def run_4v4_battle_task(origin: Message, uid: int, diff_key: str, deck: Li
                     await db.add_user_currency(uid, cur["id"], amt)
                     cur_drops.append(f"+{amt} {esc(cur['name'])}")
 
-            # Выдача заражённых в бою врагов (только при победе!)
             inf_lines = []
             for d in infected_drops:
                 sh = roll_shiny()
@@ -2325,7 +2515,7 @@ async def run_4v4_battle_task(origin: Message, uid: int, diff_key: str, deck: Li
 
 
 # ==============================================================================
-# 7. КРЕЙТЫ И ЛАБОРАТОРИЯ ПАРАЗИТОВ
+# 7. КРЕЙТЫ И ЛАБОРАТОРИЯ (МАССОВАЯ ПОКУПКА И КРАФТ ПАРАЗИТОВ)
 # ==============================================================================
 
 async def render_lab(target: Message | CallbackQuery, uid: int):
@@ -2342,17 +2532,61 @@ async def render_lab(target: Message | CallbackQuery, uid: int):
         f"💰 Монеты: <b>{u['coins']}</b>\n"
         f"🦠 Паразиты: Обыч. <b>{u['p_common']}</b> | Улучш. <b>{u['p_upgraded']}</b> | Элит. <b>{u['p_elite']}</b>\n\n"
         f"🧪 <b>Паразиты (бонус % от шанса заражения):</b>\n"
-        f"• 🦠 Обыч. (+{cb}% — {cp}💰) | ☣️ Улучш. (+{ub}% — {up}💰) | 💎 Элит. (+{eb}% — {ep}💰)\n\n"
+        f"• 🦠 Обыч. (+{cb}% — {cp}💰)\n"
+        f"• ☣️ Улучш. (+{ub}% — {up}💰)\n"
+        f"• 💎 Элит. (+{eb}% — {ep}💰)\n\n"
         f"📦 <b>Кейсы</b> (✨ Shiny: <b>{fmt_pct(cfg_float('shiny_chance_pct') * l_mult)}%</b>):"
     )
     rows = [
-        [InlineKeyboardButton(text=f"🦠 Обыч. ({cp}💰)", callback_data="lab:buy:common"), InlineKeyboardButton(text=f"☣️ Улучш. ({up}💰)", callback_data="lab:buy:upgraded")],
-        [InlineKeyboardButton(text=f"💎 Элит. паразит ({ep}💰)", callback_data="lab:buy:elite")],
-        [InlineKeyboardButton(text="⚗️ 3🦠 ➔ 1☣️", callback_data="lab:cr:upgraded"), InlineKeyboardButton(text="⚗️ 3☣️ ➔ 1💎", callback_data="lab:cr:elite")],
+        [
+            InlineKeyboardButton(text=f"🦠 Купить Обыч. ({cp}💰)", callback_data="lab:pm:common"),
+            InlineKeyboardButton(text=f"☣️ Купить Улучш. ({up}💰)", callback_data="lab:pm:upgraded"),
+        ],
+        [InlineKeyboardButton(text=f"💎 Купить Элитного ({ep}💰)", callback_data="lab:pm:elite")],
+        [
+            InlineKeyboardButton(text="⚗️ Крафт 3🦠➔1☣️", callback_data="lab:cr:upgraded:1"),
+            InlineKeyboardButton(text="⚗️ МАКС 🦠➔☣️", callback_data="lab:cr:upgraded:max"),
+        ],
+        [
+            InlineKeyboardButton(text="⚗️ Крафт 3☣️➔1💎", callback_data="lab:cr:elite:1"),
+            InlineKeyboardButton(text="⚗️ МАКС ☣️➔💎", callback_data="lab:cr:elite:max"),
+        ],
     ]
     for cr in crates:
         cname = "💰" if cr["currency_id"] == 0 else curs.get(cr["currency_id"], "🪙")
         rows.append([InlineKeyboardButton(text=f"📦 {cr['name']} — {cr['price']} {cname}", callback_data=f"cr:v:{cr['id']}")])
+    await render_view(target, txt, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+async def render_parasite_buy_menu(target: Message | CallbackQuery, uid: int, p_key: str):
+    """Меню массовой покупки выбранного паразита (x1, x3, x5, x10, x25, МАКС)."""
+    u = await db.get_user(uid)
+    name, col, price, bonus = get_parasite_info(p_key)
+    owned = u[col]
+    max_buy = u["coins"] // price if price > 0 else 0
+
+    txt = (
+        f"🧪 <b>ПОКУПКА: {name}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🦠 Бонус к шансу заражения: <b>+{bonus}%</b> от шанса\n"
+        f"💵 Цена за 1 шт.: <b>{price} 💰</b>\n"
+        f"💰 Ваш баланс: <b>{u['coins']}</b> | У вас есть: <b>{owned} шт.</b>\n\n"
+        f"👇 Выберите количество для покупки:"
+    )
+    rows = [
+        [
+            InlineKeyboardButton(text=f"x1 ({price}💰)", callback_data=f"lab:buy:{p_key}:1"),
+            InlineKeyboardButton(text=f"x3 ({price * 3}💰)", callback_data=f"lab:buy:{p_key}:3"),
+            InlineKeyboardButton(text=f"x5 ({price * 5}💰)", callback_data=f"lab:buy:{p_key}:5"),
+        ],
+        [
+            InlineKeyboardButton(text=f"x10 ({price * 10}💰)", callback_data=f"lab:buy:{p_key}:10"),
+            InlineKeyboardButton(text=f"x25 ({price * 25}💰)", callback_data=f"lab:buy:{p_key}:25"),
+        ],
+    ]
+    if max_buy > 0:
+        rows.append([InlineKeyboardButton(text=f"🔥 Купить МАКС ({max_buy} шт. — {max_buy * price}💰)", callback_data=f"lab:buy:{p_key}:max")])
+    rows.append([InlineKeyboardButton(text="🔙 Назад в Лабораторию", callback_data="lab:home")])
     await render_view(target, txt, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -2368,31 +2602,50 @@ async def cb_lab_home(cb: CallbackQuery):
     await cb.answer()
 
 
+@router.callback_query(F.data.startswith("lab:pm:"))
+async def cb_lab_pm(cb: CallbackQuery):
+    p_key = cb.data.split(":")[2]
+    if p_key not in PARASITES:
+        return
+    await render_parasite_buy_menu(cb, cb.from_user.id, p_key)
+    await cb.answer()
+
+
 @router.callback_query(F.data.startswith("lab:buy:"))
 async def cb_lab_buy(cb: CallbackQuery):
-    pk = cb.data.split(":")[2]
-    name, _, pr, _ = get_parasite_info(pk)
-    u = await db.get_user(cb.from_user.id)
-    if u["coins"] < pr:
-        await cb.answer(f"Нужно {pr} 💰!", show_alert=True)
+    _, _, pk, amt_s = cb.data.split(":")
+    if pk not in PARASITES:
         return
-    await db.add_coins(u["user_id"], -pr)
-    await db.add_parasite(u["user_id"], pk, 1)
-    await cb.answer(f"✅ Куплен: {name}!", show_alert=True)
-    await render_lab(cb, u["user_id"])
+    name, _, price, _ = get_parasite_info(pk)
+    u = await db.get_user(cb.from_user.id)
+
+    amt = (u["coins"] // price if price > 0 else 0) if amt_s == "max" else int(amt_s)
+    if amt <= 0:
+        await cb.answer(f"Недостаточно монет! Нужно минимум {price} 💰.", show_alert=True)
+        return
+    cost = price * amt
+    if u["coins"] < cost:
+        await cb.answer(f"Недостаточно монет! Нужно {cost} 💰.", show_alert=True)
+        return
+    await db.add_coins(u["user_id"], -cost)
+    await db.add_parasite(u["user_id"], pk, amt)
+    await cb.answer(f"✅ Куплено {amt} шт. «{name}» (-{cost}💰)!", show_alert=True)
+    await render_parasite_buy_menu(cb, u["user_id"], pk)
 
 
 @router.callback_query(F.data.startswith("lab:cr:"))
 async def cb_lab_cr(cb: CallbackQuery):
-    tgt = cb.data.split(":")[2]
+    _, _, tgt, mode = cb.data.split(":")
     src = "common" if tgt == "upgraded" else "upgraded"
     u = await db.get_user(cb.from_user.id)
-    if u[PARASITES[src][1]] < 3:
-        await cb.answer("Нужно минимум 3 шт.!", show_alert=True)
+    have = u[PARASITES[src][1]]
+    crafts = (have // 3) if mode == "max" else (1 if have >= 3 else 0)
+    if crafts <= 0:
+        await cb.answer(f"Нужно минимум 3 шт. «{PARASITES[src][0]}»!", show_alert=True)
         return
-    await db.add_parasite(u["user_id"], src, -3)
-    await db.add_parasite(u["user_id"], tgt, 1)
-    await cb.answer(f"⚗️ Скрафчен: {PARASITES[tgt][0]}!", show_alert=True)
+    await db.add_parasite(u["user_id"], src, -(crafts * 3))
+    await db.add_parasite(u["user_id"], tgt, crafts)
+    await cb.answer(f"⚗️ Скрафчено {crafts} шт. «{PARASITES[tgt][0]}»!", show_alert=True)
     await render_lab(cb, u["user_id"])
 
 
@@ -2575,7 +2828,7 @@ async def cb_wb_hit(cb: CallbackQuery, bot: Bot):
         top = await db.get_wb_top(wb["id"], 10)
         l_mult, _, c_mult, _ = get_active_events()
         base_ch = RARITIES.get(wb["rarity"], ("", "", 1, 0.1))[3]
-        wb_ch = calc_infect_chance(base_ch, 500, l_mult)  # x6 повышенный шанс для Топ-3
+        wb_ch = calc_infect_chance(base_ch, 500, l_mult)
         for idx, p in enumerate(top, 1):
             coins = int(max(150, 950 - (idx - 1) * 140) * c_mult)
             await db.add_coins(p["user_id"], coins)
@@ -3225,7 +3478,7 @@ async def cb_aev(cb: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminFSM.ev_cfg)
     await state.update_data(ev_type=act)
-    await cb.message.answer(f"🎉 Введите <b>множитель</b> и <b>минуты</b> через пробел (например: <code>2.0 60</code>):")
+    await cb.message.answer("🎉 Введите <b>множитель</b> и <b>минуты</b> через пробел (например: <code>2.0 60</code>):")
     await cb.answer()
 
 
@@ -3653,7 +3906,7 @@ async def cb_noop(cb: CallbackQuery):
 
 
 # ==============================================================================
-# 11. ФОНОВЫЙ БЭКАП И ЗАПУСК
+# 11. ФОНОВЫЙ БЭКАП И ЗАПУСК БОТА
 # ==============================================================================
 
 async def auto_backup_task(bot: Bot) -> None:
