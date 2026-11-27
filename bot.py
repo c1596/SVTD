@@ -135,16 +135,16 @@ GAME_SETTINGS: Dict[str, str] = dict(DEFAULT_SETTINGS)
 
 SETTING_META: Dict[str, Tuple[str, str, float, float]] = {
     "infected_mult": ("🦠 Множитель Infected", "float", 1.0, 5.0),
-    "shiny_chance_pct": ("✨ Шанс Shiny (%)", "float", 0.1, 100.0),
-    "shiny_bonus_pct": ("✨ Бонус Shiny (%)", "int", 5, 200),
-    "admin_sign_pct": ("👑 Админ-сигна (+% ATK/HP)", "int", 1, 100),
-    "partner_sign_pct": ("🤝 Партнёр-сигна (+% ATK/HP)", "int", 1, 100),
+    "shiny_chance_pct": ("✨ Шанс Shiny (%)", "float", 0.0001, 100.0),
+    "shiny_bonus_pct": ("✨ Бонус Shiny (%)", "float", 0.01, 500.0),
+    "admin_sign_pct": ("👑 Админ-сигна (+% ATK/HP)", "float", 0.01, 200.0),
+    "partner_sign_pct": ("🤝 Партнёр-сигна (+% ATK/HP)", "float", 0.01, 200.0),
     "p_common_price": ("🦠 Цена Обыч. паразита", "int", 10, 50000),
-    "p_common_bonus": ("🦠 Бонус Обыч. паразита (%)", "int", 1, 500),
+    "p_common_bonus": ("🦠 Бонус Обыч. паразита (%)", "float", 0.01, 500.0),
     "p_upgraded_price": ("☣️ Цена Улучш. паразита", "int", 10, 100000),
-    "p_upgraded_bonus": ("☣️ Бонус Улучш. паразита (%)", "int", 1, 500),
+    "p_upgraded_bonus": ("☣️ Бонус Улучш. паразита (%)", "float", 0.01, 500.0),
     "p_elite_price": ("💎 Цена Элит. паразита", "int", 10, 200000),
-    "p_elite_bonus": ("💎 Бонус Элит. паразита (%)", "int", 1, 500),
+    "p_elite_bonus": ("💎 Бонус Элит. паразита (%)", "float", 0.01, 500.0),
     "battle_delay_sec": ("⏱ Пауза хода в бою (сек)", "float", 0.5, 4.0),
     "wb_cooldown_sec": ("🌍 КД Мирового Босса (сек)", "int", 5, 600),
 }
@@ -306,18 +306,27 @@ def get_rank_info(trophies: int) -> Tuple[int, str, float, float, int]:
     return res
 
 
-def get_parasite_info(p_key: str) -> Tuple[str, str, int, int]:
+def get_parasite_info(p_key: str) -> Tuple[str, str, int, float]:
     name, col = PARASITES[p_key]
-    return name, col, cfg_int(f"p_{p_key}_price"), cfg_int(f"p_{p_key}_bonus")
+    return name, col, cfg_int(f"p_{p_key}_price"), cfg_float(f"p_{p_key}_bonus")
+
+
+def parse_float(raw: Optional[str]) -> float:
+    """Парсит целые и дробные числа с точкой, запятой или знаком % (напр. '2.5%', '0,125%')."""
+    s = (raw or "").strip().replace("%", "").replace("x", "").replace("х", "").replace(",", ".").strip()
+    val = float(s)
+    if val != val or val in (float("inf"), float("-inf")):
+        raise ValueError("Invalid float")
+    return val
 
 
 def calc_infect_chance(base: float, bonus_pct: float, luck_mult: float = 1.0) -> float:
     """Формула: base * (1 + bonus_pct / 100) * luck_mult. Пример: 1% + 5% = 1.05%."""
-    return min(95.0, round(float(base) * (1.0 + float(bonus_pct) / 100.0) * float(luck_mult), 5))
+    return min(95.0, round(float(base) * (1.0 + float(bonus_pct) / 100.0) * float(luck_mult), 6))
 
 
 def fmt_pct(v: float) -> str:
-    s = f"{float(v):.4f}".rstrip("0").rstrip(".")
+    s = f"{float(v):.6f}".rstrip("0").rstrip(".")
     return s or "0"
 
 
@@ -1350,10 +1359,10 @@ def get_sign_text(item: Dict[str, Any]) -> str:
     st = item.get("sign_type", "none")
     if st == "none":
         return "Нет"
-    pct = cfg_int("admin_sign_pct") if st == "admin" else cfg_int("partner_sign_pct")
+    pct = cfg_float("admin_sign_pct") if st == "admin" else cfg_float("partner_sign_pct")
     role = "👑 Admin Sign" if st == "admin" else "🤝 Partner Sign"
     who = f" ({esc(item.get('signed_by'))})" if item.get("signed_by") else ""
-    return f"{role} (+{pct}% ATK/HP){who}"
+    return f"{role} (+{fmt_pct(pct)}% ATK/HP){who}"
 
 
 def calc_card_stats(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -1422,7 +1431,7 @@ def format_card_info(item: Dict[str, Any], ex_tot: int = 0, ex_sh: int = 0, ex_i
     else:
         lines.append(f"• ⚔️ ATK: <b>{st['atk']}</b> | ❤️ HP: <b>{st['hp']}</b> | ⚡ Power: <b>{st['power']}</b>")
 
-    sh_t = f"✨ Shiny (+{cfg_int('shiny_bonus_pct')}%)" if item.get("is_shiny") else "Normal"
+    sh_t = f"✨ Shiny (+{fmt_pct(cfg_float('shiny_bonus_pct'))}%)" if item.get("is_shiny") else "Normal"
     inf_t = f"🦠 Infected (x{cfg_float('infected_mult')})" if item.get("is_infected") else "None"
     lines.extend([
         "",
@@ -2319,8 +2328,8 @@ async def render_card_view(target: Message | CallbackQuery, uid: int, inv_id: in
         act = []
         role = await db.get_signer_role(uid)
         if role:
-            pct = cfg_int("admin_sign_pct") if role == "admin" else cfg_int("partner_sign_pct")
-            act.append(InlineKeyboardButton(text=f"{'👑' if role == 'admin' else '🤝'} Подписать (+{pct}%)", callback_data=f"c:sgn:{inv_id}:{flt}:{page}"))
+            pct = cfg_float("admin_sign_pct") if role == "admin" else cfg_float("partner_sign_pct")
+            act.append(InlineKeyboardButton(text=f"{'👑' if role == 'admin' else '🤝'} Подписать (+{fmt_pct(pct)}%)", callback_data=f"c:sgn:{inv_id}:{flt}:{page}"))
         act.append(InlineKeyboardButton(text="🏷 На Рынок", callback_data=f"c:sell:{inv_id}"))
         rows.append(act)
     rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="eq:home" if flt == "deck" else f"inv:{flt}:{page}")])
@@ -2354,7 +2363,7 @@ async def render_index(target: Message | CallbackQuery, uid: int, page: int = 0)
         for cid_s, w_val in w_map.items():
             if float(w_val) > 0:
                 pct = (float(w_val) / tot_w) * 100.0
-                crate_sources.setdefault(int(cid_s), []).append(f"{cr['name']} ({pct:.1f}%)")
+                crate_sources.setdefault(int(cid_s), []).append(f"{cr['name']} ({fmt_pct(pct)}%)")
 
     all_cards.sort(key=lambda c: (get_rarity(c["rarity"])["weight"], c["id"]), reverse=True)
 
@@ -2545,8 +2554,8 @@ async def cb_csgn(cb: CallbackQuery):
     u = await db.get_user(uid)
     who = f"@{u['username']}" if u and u.get("username") else (u["full_name"] if u else str(uid))
     await db.sign_inv_item(int(iid), role, who)
-    pct = cfg_int("admin_sign_pct") if role == "admin" else cfg_int("partner_sign_pct")
-    await cb.answer(f"✍️ Signed (+{pct}% ATK/HP)!", show_alert=True)
+    pct = cfg_float("admin_sign_pct") if role == "admin" else cfg_float("partner_sign_pct")
+    await cb.answer(f"✍️ Signed (+{fmt_pct(pct)}% ATK/HP)!", show_alert=True)
     await render_card_view(cb, uid, int(iid), flt, int(p))
 
 
@@ -2593,8 +2602,8 @@ async def render_battle_hub(target: Message | CallbackQuery, uid: int):
     if armed in PARASITES and u[PARASITES[armed][1]] <= 0:
         armed = "none"
         await db.update_user(uid, armed_parasite="none")
-    p_bonus = cfg_int(f"p_{armed}_bonus") if armed in PARASITES else 0
-    p_label = f"{PARASITES[armed][0]} (+{p_bonus}%)" if armed in PARASITES else "Без паразита (+0%)"
+    p_bonus = cfg_float(f"p_{armed}_bonus") if armed in PARASITES else 0.0
+    p_label = f"{PARASITES[armed][0]} (+{fmt_pct(p_bonus)}%)" if armed in PARASITES else "Без паразита (+0%)"
     mod_inf = sum(v[3] for k, v in BATTLE_MODS.items() if u.get(k))
     l_mult, _, c_mult, _ = get_active_events()
     tot_bonus = r_inf + p_bonus + u["pity_bonus"] + mod_inf
@@ -2655,7 +2664,7 @@ async def cb_btl_par(cb: CallbackQuery):
     for k in ("common", "upgraded", "elite"):
         name, col, _, bon = get_parasite_info(k)
         cnt = u[col]
-        rows.append([InlineKeyboardButton(text=f"{'✅ ' if cur == k else ''}{name} (+{bon}%) — {cnt} шт.", callback_data=f"btl:setp:{k}")])
+        rows.append([InlineKeyboardButton(text=f"{'✅ ' if cur == k else ''}{name} (+{fmt_pct(bon)}%) — {cnt} шт.", callback_data=f"btl:setp:{k}")])
     rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="btl:hub")])
     await render_view(cb, "🦠 <b>ВЫБОР ПАРАЗИТА НА БОЙ</b>\n1 паразит тратится в начале боя и усиливает шанс заражения всех врагов.", InlineKeyboardMarkup(inline_keyboard=rows))
     await cb.answer()
@@ -2715,13 +2724,13 @@ async def run_4v4_battle_task(origin: Message, uid: int, diff_key: str, deck: Li
         d_name, _, d_rew_scale, _, d_inf_bonus = DIFFICULTIES[diff_key]
         l_mult, _, c_event_mult, _ = get_active_events()
 
-        # Расход выбранного паразита
+         # Расход выбранного паразита
         armed = u["armed_parasite"]
-        p_bonus = 0
+        p_bonus = 0.0
         p_used_label = ""
         if armed in PARASITES and u[PARASITES[armed][1]] > 0:
             await db.add_parasite(uid, armed, -1)
-            p_bonus = cfg_int(f"p_{armed}_bonus")
+            p_bonus = cfg_float(f"p_{armed}_bonus")
             p_used_label = f" | {PARASITES[armed][0]}"
             if u[PARASITES[armed][1]] - 1 <= 0:
                 await db.update_user(uid, armed_parasite="none")
@@ -2900,9 +2909,9 @@ async def render_lab(target: Message | CallbackQuery, uid: int):
     u_curs = await db.get_user_currencies(uid)
     l_mult, _, _, _ = get_active_events()
 
-    cp, cb_ = cfg_int("p_common_price"), cfg_int("p_common_bonus")
-    up, ub = cfg_int("p_upgraded_price"), cfg_int("p_upgraded_bonus")
-    ep, eb = cfg_int("p_elite_price"), cfg_int("p_elite_bonus")
+    cp, cb_ = cfg_int("p_common_price"), cfg_float("p_common_bonus")
+    up, ub = cfg_int("p_upgraded_price"), cfg_float("p_upgraded_bonus")
+    ep, eb = cfg_int("p_elite_price"), cfg_float("p_elite_bonus")
 
     extra_bal = " | ".join(f"{esc(c['name'])}: <b>{c['amount']}</b>" for c in u_curs)
     text = (
@@ -2911,9 +2920,9 @@ async def render_lab(target: Message | CallbackQuery, uid: int):
         f"💰 Монеты: <b>{u['coins']}</b>" + (f"\n🪙 {extra_bal}" if extra_bal else "") + "\n"
         f"🦠 Паразиты: Обыч. <b>{u['p_common']}</b> | Улучш. <b>{u['p_upgraded']}</b> | Элит. <b>{u['p_elite']}</b>\n\n"
         f"🧪 <b>Паразиты (нажмите, чтобы купить x1 / x5 / x10 / МАКС):</b>\n"
-        f"• 🦠 Обычный: <b>+{cb_}%</b> ({cp}💰)\n"
-        f"• ☣️ Улучшенный: <b>+{ub}%</b> ({up}💰)\n"
-        f"• 💎 Элитный: <b>+{eb}%</b> ({ep}💰)\n\n"
+        f"• 🦠 Обычный: <b>+{fmt_pct(cb_)}%</b> ({cp}💰)\n"
+        f"• ☣️ Улучшенный: <b>+{fmt_pct(ub)}%</b> ({up}💰)\n"
+        f"• 💎 Элитный: <b>+{fmt_pct(eb)}%</b> ({ep}💰)\n\n"
         f"📦 <b>Крейты</b> (✨ Shiny: {fmt_pct(cfg_float('shiny_chance_pct') * l_mult)}%):"
     )
     if not crates:
@@ -2951,7 +2960,7 @@ async def render_parasite_buy_menu(target: Message | CallbackQuery, uid: int, p_
         f"━━━━━━━━━━━━━━━━━━\n"
         f"💰 Ваш баланс: <b>{u['coins']} монет</b>\n"
         f"🎒 В наличии: <b>{owned} шт.</b>\n"
-        f"🦠 Бонус к шансу заражения: <b>+{bon}%</b> от базового шанса\n"
+        f"🦠 Бонус к шансу заражения: <b>+{fmt_pct(bon)}%</b> от базового шанса\n"
         f"💵 Цена за 1 шт.: <b>{price} 💰</b>\n\n"
         f"👇 Выберите, сколько паразитов купить:"
     )
@@ -3069,7 +3078,7 @@ async def cb_cr_info(cb: CallbackQuery):
     ]
     for co, ew in sorted(eff, key=lambda x: x[1], reverse=True):
         r_ico = get_rarity(co["rarity"])["emoji"]
-        lines.append(f"• {r_ico} <b>{esc(co['name'])}</b> — {(ew / tot * 100):.2f}%")
+        lines.append(f"• {r_ico} <b>{esc(co['name'])}</b> — {fmt_pct(ew / tot * 100)}%")
     if not eff:
         lines.append("<i>Крейт пуст.</i>")
 
@@ -3492,14 +3501,16 @@ async def fsm_arar_create(m: Message, state: FSMContext):
         name = parts[0]
         emoji = parts[1] if len(parts) > 1 and parts[1] else "✨"
         weight = int(parts[2]) if len(parts) > 2 else (max((r["weight"] for r in RARITIES_CACHE.values()), default=0) + 1)
-        inf_ch = float(parts[3].replace(",", ".")) if len(parts) > 3 else 0.01
+        inf_ch = parse_float(parts[3]) if len(parts) > 3 else 0.01
+        if not (0.0 <= inf_ch <= 100.0):
+            raise ValueError
         has_ser = 1 if (len(parts) > 4 and parts[4] == "1") else 0
         key = re.sub(r"[^a-z0-9_]", "", name.lower().replace(" ", "_")) or f"rar_{int(time.time())}"
         if key in RARITIES_CACHE:
             await m.answer(f"❌ Редкость с ключом <code>{key}</code> уже существует!")
             return
     except (ValueError, IndexError):
-        await m.answer("❌ Неверный формат! Пример: <code>Divine | 🌈 | 8 | 0.008 | 1</code>")
+        await m.answer("❌ Неверный формат! Пример: <code>Divine | 🌈 | 8 | 0.125% | 1</code>")
         return
     await db.create_rarity(key, name, emoji, weight, inf_ch, has_ser)
     await db.log_admin(m.from_user.id, f"Создал редкость {name} ({key})")
@@ -3538,9 +3549,16 @@ async def fsm_arar_ed_val(m: Message, state: FSMContext):
     rk, fld = d["rk"], d["fld"]
     try:
         raw = (m.text or "").strip()
-        val: Any = int(raw) if fld == "weight" else (float(raw.replace(",", ".")) if fld == "infect_chance" else raw)
+        if fld == "weight":
+            val: Any = int(raw)
+        elif fld == "infect_chance":
+            val = parse_float(raw)
+            if not (0.0 <= val <= 100.0):
+                raise ValueError
+        else:
+            val = raw
     except ValueError:
-        await m.answer("❌ Неверный формат.")
+        await m.answer("❌ Неверный формат. Для процента можно вводить дробные числа (напр. <code>2.5%</code> или <code>0.125</code>).")
         return
     await db.update_rarity(rk, **{fld: val})
     await render_adm_rarity_editor(m, rk)
@@ -3812,9 +3830,9 @@ async def fsm_ac_stats(m: Message, state: FSMContext):
 
 @router.message(CardFSM.boost)
 async def fsm_ac_boost(m: Message, state: FSMContext):
-    p = (m.text or "").replace(",", ".").split()
+    p = (m.text or "").split()
     try:
-        bd, bh = float(p[0]), float(p[1])
+        bd, bh = parse_float(p[0]), parse_float(p[1])
     except (ValueError, IndexError):
         await m.answer("❌ Пример: <code>1.25 1.15</code>")
         return
@@ -4017,11 +4035,13 @@ async def cb_acu_cfg(cb: CallbackQuery, state: FSMContext):
 async def fsm_acu_cfg(m: Message, state: FSMContext):
     d = await state.get_data()
     await state.clear()
-    p = (m.text or "").replace(",", ".").split()
+    p = (m.text or "").split()
     try:
-        ch, mn, mx = float(p[0]), int(p[1]), int(p[2])
+        ch, mn, mx = parse_float(p[0]), int(p[1]), int(p[2])
+        if not (0.0 <= ch <= 100.0) or mn < 1 or mx < mn:
+            raise ValueError
     except (ValueError, IndexError):
-        await m.answer("❌ Пример: <code>25 1 5</code>")
+        await m.answer("❌ Пример: <code>2.5% 1 5</code> или <code>0.125 1 5</code>")
         return
     await db.update_currency(d["cid"], drop_chance=ch, drop_min=mn, drop_max=mx, drop_in_battles=1)
     await m.answer("✅ Параметры дропа сохранены!")
@@ -4111,7 +4131,10 @@ async def _show_cr_builder(target: Message | CallbackQuery, state: FSMContext):
     cmap = d.get("cards", {})
     all_c = await db.list_cards()
     by_id = {str(x["id"]): x for x in all_c}
-    lines = [f"📦 <b>Состав «{esc(d['name'])}»</b>:"] + [f"• {esc(by_id[k]['name']) if k in by_id else k} — вес <b>{w}</b>" for k, w in cmap.items()]
+    lines = [f"📦 <b>Состав «{esc(d['name'])}»</b>:"] + [
+        f"• {esc(by_id[k]['name']) if k in by_id else k} — вес/шанс <b>{fmt_pct(w)}</b>"
+        for k, w in cmap.items()
+    ]
     rows, row = [], []
     for c in all_c[:24]:
         row.append(InlineKeyboardButton(text=c["name"][:14], callback_data=f"acrb:c:{c['id']}"))
@@ -4130,23 +4153,24 @@ async def _show_cr_builder(target: Message | CallbackQuery, state: FSMContext):
 async def cb_acrb_c(cb: CallbackQuery, state: FSMContext):
     await state.update_data(sel_c=cb.data.split(":")[2])
     await state.set_state(CrateFSM.weight)
-    await cb.message.answer("⚖️ Введите вес выпадения (число, напр. <code>20</code>):")
+    await cb.message.answer("⚖️ Введите вес / шанс выпадения (можно дробное, напр. <code>20</code>, <code>2.5%</code>, <code>0.125%</code>):")
     await cb.answer()
 
 
 @router.message(CrateFSM.weight)
 async def fsm_acrb_w(m: Message, state: FSMContext):
     try:
-        w = int((m.text or "").strip())
+        w = parse_float(m.text)
+        if w <= 0:
+            raise ValueError
     except ValueError:
-        await m.answer("❌ Введите число.")
+        await m.answer("❌ Введите положительное число (напр. <code>2.5%</code> или <code>0.125</code>).")
         return
     d = await state.get_data()
     cm = dict(d.get("cards", {}))
     cm[d["sel_c"]] = w
     await state.update_data(cards=cm)
     await _show_cr_builder(m, state)
-
 
 @router.callback_query(CrateFSM.builder, F.data == "acrb:save")
 async def cb_acrb_save(cb: CallbackQuery, state: FSMContext):
@@ -4235,13 +4259,13 @@ async def cb_aev_start(cb: CallbackQuery, state: FSMContext):
 async def fsm_aev_save(m: Message, state: FSMContext, bot: Bot):
     d = await state.get_data()
     await state.clear()
-    p = (m.text or "").replace(",", ".").split()
+    p = (m.text or "").split()
     try:
-        mult, mins = float(p[0]), int(p[1])
+        mult, mins = parse_float(p[0]), int(p[1])
         if mult < 1.0 or mins <= 0:
             raise ValueError
     except (ValueError, IndexError):
-        await m.answer("❌ Пример: <code>2.0 60</code>")
+        await m.answer("❌ Пример: <code>2.5 60</code>")
         return
     end_ts = str(int(time.time()) + mins * 60)
     if d["ev_type"] == "luck":
@@ -4306,12 +4330,11 @@ async def fsm_aset(m: Message, state: FSMContext):
     k, p = d["k"], d["p"]
     _, vt, mn, mx = SETTING_META[k]
     try:
-        raw = (m.text or "").replace(",", ".").strip()
-        num = int(raw) if vt == "int" else float(raw)
+        num = int(parse_float(m.text)) if vt == "int" else parse_float(m.text)
         if not (mn <= num <= mx):
             raise ValueError
     except ValueError:
-        await m.answer(f"❌ Число от {mn} до {mx}.")
+        await m.answer(f"❌ Введите число от {mn} до {mx} (можно с точкой/запятой и %).")
         return
     await db.set_setting(k, str(num))
     await render_adm_settings(m, p)
