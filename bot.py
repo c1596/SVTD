@@ -2941,9 +2941,70 @@ async def cb_btl_surr(cb: CallbackQuery):
     await cb.answer("🏳️ Вы сдались!", show_alert=True)
 
 
+def _cleanup_stale_user_battle(uid: int) -> None:
+    """Снимает зависшую блокировку боя, если он не активен или идёт дольше 180 сек."""
+    now = time.monotonic()
+    has_live = False
+    for bid, st in list(ACTIVE_BATTLES.items()):
+        if st.get("uid") == uid:
+            if (now - st.get("started_at", now)) > 180.0:
+                ACTIVE_BATTLES.pop(bid, None)
+            else:
+                has_live = True
+    if not has_live:
+        USERS_IN_BATTLE.discard(uid)
+
+
+async def _battle_sleep(st: Dict[str, Any], seconds: float) -> None:
+    """Пауза между раундами с мгновенной реакцией на кнопку «Сдаться»."""
+    end_t = time.monotonic() + max(0.25, seconds)
+    while time.monotonic() < end_t:
+        if st.get("surrendered"):
+            break
+        await asyncio.sleep(min(0.25, max(0.05, end_t - time.monotonic())))
+
+
+async def _deliver_battle_final(
+    msg: Optional[Message],
+    origin: Message,
+    text: str,
+    kb: InlineKeyboardMarkup,
+    flood_until: float,
+) -> None:
+    """Гарантированно доставляет финальный экран боя, даже если чат поймал Flood Control."""
+    wait_left = flood_until - time.monotonic()
+    if wait_left > 0:
+        await asyncio.sleep(min(wait_left, 35.0))
+
+    for _ in range(2):
+        try:
+            if msg is not None:
+                await asyncio.wait_for(msg.edit_text(text[:4096], reply_markup=kb), timeout=12.0)
+                return
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(min(e.retry_after + 0.5, 35.0))
+            continue
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e).lower():
+                return
+            break
+        except Exception:
+            break
+
+    for _ in range(2):
+        try:
+            await asyncio.wait_for(origin.answer(text[:4096], reply_markup=kb), timeout=12.0)
+            return
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(min(e.retry_after + 0.5, 35.0))
+        except Exception:
+            return
+
+
 @router.callback_query(F.data.startswith("btl:go:"))
 async def cb_btl_go(cb: CallbackQuery):
     uid = cb.from_user.id
+    _cleanup_stale_user_battle(uid)
     if uid in USERS_IN_BATTLE:
         await cb.answer("Вы уже в бою!", show_alert=True)
         return
@@ -2959,13 +3020,16 @@ async def cb_btl_go(cb: CallbackQuery):
         return
 
     USERS_IN_BATTLE.add(uid)
-    await cb.answer("⚔️ Выходим на арену!")
+    try:
+        await cb.answer("⚔️ Выходим на арену!")
+    except Exception:
+        pass
     asyncio.create_task(run_4v4_battle_task(cb.message, uid, diff_key, deck))
 
 
 async def run_4v4_battle_task(origin: Message, uid: int, diff_key: str, deck: List[Dict[str, Any]]) -> None:
     bid = uuid.uuid4().hex[:10]
-    ACTIVE_BATTLES[bid] = {"uid": uid, "surrendered": False}
+    ACTIVE_BATTLES[bid] = {"uid": uid, "surrendered": False, "started_at": time.monotonic()}
     try:
         u = await db.get_user(uid)
         rank_idx, r_name, _, r_rew_mult, r_inf_bonus = get_rank_info(u["trophies"])
@@ -3012,15 +3076,31 @@ async def run_4v4_battle_task(origin: Message, uid: int, diff_key: str, deck: Li
         dmg_tracker: Dict[int, float] = {}
         infected_drops: List[Dict[str, Any]] = []
         crit_ch = 0.20 if mods.get("mod_player_crit") else 0.0
-        delay = cfg_float("battle_delay_sec")
+        delay = max(1.0, cfg_float("battle_delay_sec"))
         title = f"⚔️ {d_name}{p_used_label}"
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏳️ Сдаться", callback_data=f"btl:surr:{bid}")]])
 
-        msg = await origin.answer(render_battle_screen(title, u["full_name"], t1, d_name, t2, logs, 0, 0), reply_markup=kb)
+        msg: Optional[Message] = None
+        flood_until = 0.0
+        init_text = render_battle_screen(title, u["full_name"], t1, d_name, t2, logs, 0, 0)
+        for _ in range(2):
+            try:
+                msg = await asyncio.wait_for(origin.answer(init_text, reply_markup=kb), timeout=12.0)
+                break
+            except TelegramRetryAfter as e:
+                flood_until = time.monotonic() + e.retry_after + 1.0
+                await asyncio.sleep(min(e.retry_after + 0.5, 30.0))
+            except Exception:
+                break
 
+        last_edit_ts = time.monotonic()
+        edits_count = 0
         winner = 0
+        st = ACTIVE_BATTLES[bid]
+
+        await _battle_sleep(st, min(delay, 1.5))
+
         for rnd in range(1, 36):
-            st = ACTIVE_BATTLES[bid]
             if st["surrendered"]:
                 winner = 2
                 break
@@ -3032,25 +3112,35 @@ async def run_4v4_battle_task(origin: Message, uid: int, diff_key: str, deck: Li
                 break
 
             perform_combat_turn(t1, t2, True, logs, dmg_tracker, infected_drops, total_inf_bonus, l_mult, crit_ch)
-            if any(x["hp"] > 0 for x in t2):
-                if mods.get("mod_enemy_regen"):
-                    for e in t2:
-                        if e["hp"] > 0 and e["hp"] < e["max_hp"]:
-                            e["hp"] = min(e["max_hp"], e["hp"] + max(1, int(e["max_hp"] * 0.05)))
-                perform_combat_turn(t2, t1, False, logs, dmg_tracker, infected_drops, total_inf_bonus, l_mult, 0.0)
+            if not any(x["hp"] > 0 for x in t2):
+                winner = 1
+                break
 
-            try:
-                await msg.edit_text(render_battle_screen(title, u["full_name"], t1, d_name, t2, logs, rnd, len(infected_drops)), reply_markup=kb)
-            except TelegramRetryAfter as e:
-                await asyncio.sleep(e.retry_after)
-            except Exception:
-                pass
+            if mods.get("mod_enemy_regen"):
+                for e in t2:
+                    if e["hp"] > 0 and e["hp"] < e["max_hp"]:
+                        e["hp"] = min(e["max_hp"], e["hp"] + max(1, int(e["max_hp"] * 0.05)))
+            perform_combat_turn(t2, t1, False, logs, dmg_tracker, infected_drops, total_inf_bonus, l_mult, 0.0)
+            if not any(x["hp"] > 0 for x in t1):
+                winner = 2
+                break
 
-            ticks = max(1, int(delay / 0.25))
-            for _ in range(ticks):
-                if st["surrendered"]:
-                    break
-                await asyncio.sleep(0.25)
+            # Анти-флуд: не более ~18-19 правок/мин, чтобы Telegram никогда не вешал Flood Control
+            now_t = time.monotonic()
+            min_edit_gap = 1.5 if edits_count == 0 else max(delay, 3.2)
+            if msg is not None and now_t >= flood_until and (now_t - last_edit_ts) >= min_edit_gap:
+                screen = render_battle_screen(title, u["full_name"], t1, d_name, t2, logs, rnd, len(infected_drops))
+                try:
+                    await asyncio.wait_for(msg.edit_text(screen, reply_markup=kb), timeout=10.0)
+                    last_edit_ts = time.monotonic()
+                    edits_count += 1
+                except TelegramRetryAfter as e:
+                    # Не замораживаем бой — пропускаем промежуточные правки до конца КД
+                    flood_until = time.monotonic() + e.retry_after + 1.0
+                except Exception:
+                    pass
+
+            await _battle_sleep(st, delay)
 
         if winner == 0:
             r1 = sum(x["hp"] for x in t1) / max(1, sum(x["max_hp"] for x in t1))
@@ -3135,10 +3225,7 @@ async def run_4v4_battle_task(origin: Message, uid: int, diff_key: str, deck: Li
                 res_lines.append("<i>⚠️ Заражённые в бою враги сбежали, т.к. отряд проиграл.</i>")
 
         fin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚔️ Ещё бой", callback_data=f"btl:go:{diff_key}"), InlineKeyboardButton(text="🔙 В меню боя", callback_data="btl:hub")]])
-        try:
-            await msg.edit_text("\n".join(res_lines), reply_markup=fin_kb)
-        except Exception:
-            await origin.answer("\n".join(res_lines), reply_markup=fin_kb)
+        await _deliver_battle_final(msg, origin, "\n".join(res_lines), fin_kb, flood_until)
     except Exception as exc:
         logger.exception("Battle error: %s", exc)
     finally:
