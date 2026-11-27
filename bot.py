@@ -1687,7 +1687,7 @@ class AccessMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any],
     ) -> Any:
-       tg_user = data.get("event_from_user") or getattr(event, "from_user", None)
+        tg_user = data.get("event_from_user") or getattr(event, "from_user", None)
         if tg_user and not tg_user.is_bot:
             user, _ = await db.ensure_user(tg_user.id, tg_user.username, tg_user.full_name)
             is_adm = await db.is_admin(tg_user.id)
