@@ -103,7 +103,9 @@ FONT_FILE = "bot_font.ttf"
 FONT_URL = "https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Bold.ttf"
 if not os.path.exists(FONT_FILE):
     try:
-        urllib.request.urlretrieve(FONT_URL, FONT_FILE)
+        with urllib.request.urlopen(FONT_URL, timeout=5) as resp:
+            with open(FONT_FILE, "wb") as f:
+                f.write(resp.read())
     except Exception:
         pass
 
@@ -1685,7 +1687,7 @@ class AccessMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any],
     ) -> Any:
-        tg_user = data.get("event_from_user")
+       tg_user = data.get("event_from_user") or getattr(event, "from_user", None)
         if tg_user and not tg_user.is_bot:
             user, _ = await db.ensure_user(tg_user.id, tg_user.username, tg_user.full_name)
             is_adm = await db.is_admin(tg_user.id)
@@ -2977,7 +2979,7 @@ async def process_td_turn(bid: int, bot: Bot, delay: float) -> None:
     await update_battle_ui(bid, bot)
 
 
-sync def finish_td_battle(bid: int, bot: Bot, is_win: bool) -> None:
+async def finish_td_battle(bid: int, bot: Bot, is_win: bool) -> None:
     b = ACTIVE_BATTLES.get(bid)
     if not b:
         return
@@ -5269,16 +5271,17 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
 
     mw = AccessMiddleware()
-    dp.message.middleware(mw)
-    dp.callback_query.middleware(mw)
+    dp.message.outer_middleware(mw)
+    dp.callback_query.outer_middleware(mw)
     dp.include_router(router)
 
     asyncio.create_task(auto_backup_task(bot))
     asyncio.create_task(hourly_crate_rotation_task())
 
-    logger.info("🚀 Skibidi Verse Tower Defense Bot запущен! Владелец: %s", OWNER_ID)
+    me = await bot.get_me()
+    logger.info("🚀 Бот @%s (ID: %s) запущен! Владелец: %s", me.username, me.id, OWNER_ID)
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
 if __name__ == "__main__":
