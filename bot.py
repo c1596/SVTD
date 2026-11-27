@@ -3141,7 +3141,6 @@ async def cb_b_deploy(callback: CallbackQuery, bot: Bot):
     await update_battle_ui(bid, bot)
     await callback.answer(f"🛡 {item['name']} выставлен (-{st['deploy_cost']}💰)")
 
-
 @router.callback_query(F.data.startswith("b:up:"))
 async def cb_b_upgrade(callback: CallbackQuery, bot: Bot):
     _, _, bid_s, inv_s, tier_s = callback.data.split(":")
@@ -3153,3 +3152,2117 @@ async def cb_b_upgrade(callback: CallbackQuery, bot: Bot):
         return
     p = b["players"][uid]
     target = next((d for d in p["deployed"] if d["inv_id"] == inv_id and d["tier"] == tier), None)
+    if not target:
+        await callback.answer("Юнит не найден или уже улучшен!", show_alert=True)
+        return
+    nxt_tier = tier + 1
+    cost = get_tier_upgrade_cost(target["item"], nxt_tier)
+    if cost is None:
+        await callback.answer("Максимальный тир в катке достигнут!", show_alert=True)
+        return
+    if p["coins"] < cost:
+        await callback.answer(f"Недостаточно монет! Нужно {cost} 💰.", show_alert=True)
+        return
+    p["coins"] -= cost
+    target["tier"] = nxt_tier
+    await update_battle_ui(bid, bot)
+    await callback.answer(f"⬆️ {target['item']['name']} ➔ Тир {nxt_tier} (-{cost}💰)")
+
+
+# --- ФАЗА ЗАРАЖЕНИЯ БОССА (шанс = база + бонус паразита + пити) ---
+
+@router.callback_query(F.data.startswith("td:inf:"))
+async def cb_td_infect(callback: CallbackQuery):
+    uid = callback.from_user.id
+    inf = PENDING_INFECTIONS.get(uid)
+    if not inf:
+        await callback.answer("Фаза заражения уже завершена.", show_alert=True)
+        return
+
+    p_key = callback.data.split(":")[2]
+    if p_key == "skip":
+        PENDING_INFECTIONS.pop(uid, None)
+        await render_view(callback, "💨 Вы пропустили заражение и вернулись на базу.")
+        await callback.answer()
+        return
+
+    if p_key not in PARASITES_META:
+        return
+    p_name, p_col, _, p_bonus = get_parasite_info(p_key)
+    u = await db.get_user(uid)
+    if u[p_col] <= 0:
+        await callback.answer(f"У вас нет «{p_name}»! Купите в «📦 Крейты и Лаба».", show_alert=True)
+        return
+
+    PENDING_INFECTIONS.pop(uid, None)
+    await db.add_parasite(uid, p_key, -1)
+
+    # Формула: базовый шанс босса (напр. 1%) + бонус паразита (напр. 5%) + пити
+    total_chance = min(95, inf["base_chance"] + p_bonus + u["pity_bonus"])
+    roll = random.randint(1, 100)
+
+    if roll <= total_chance:
+        target_unit = await db.get_unit(inf["infected_unit_id"]) if inf["infected_unit_id"] else None
+        if not target_unit:
+            all_u = await db.list_units()
+            target_unit = next((x for x in all_u if x["faction"] == "infected"), all_u[0] if all_u else None)
+
+        if not target_unit:
+            await render_view(callback, "❌ В базе нет юнита для выдачи. Обратитесь к админу.")
+            await callback.answer()
+            return
+
+        shiny = roll_shiny()
+        await db.give_unit(uid, target_unit["id"], is_shiny=shiny, is_infected=1)
+        await db.update_user(uid, infections_success=u["infections_success"] + 1, pity_bonus=0)
+
+        sh_txt = f"\n✨ <b>ВЫПАЛ SHINY (+{cfg_int('shiny_bonus_pct')}%)!</b>" if shiny else ""
+        text = (
+            f"🦠💥 <b>УСПЕШНОЕ ЗАРАЖЕНИЕ!</b> (Шанс {total_chance}%: {inf['base_chance']}%+{p_bonus}%)\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🎁 Получен юнит: <b>{esc(target_unit['name'])}</b>\n"
+            f"🧬 Статус: <b>🦠 Инфектед (x{cfg_float('infected_mult')} урон)</b>{sh_txt}\n\n"
+            f"<i>Наденьте его в «🃏 Колода и Юниты»!</i>"
+        )
+        await render_view(callback, text, photo=target_unit.get("photo_id") or None)
+        await callback.answer("🦠 ЗАРАЖЁН!", show_alert=True)
+    else:
+        new_pity = min(35, u["pity_bonus"] + 2)
+        await db.update_user(uid, infections_fail=u["infections_fail"] + 1, pity_bonus=new_pity)
+        await render_view(
+            callback,
+            f"💔 <b>ЗАРАЖЕНИЕ НЕ СРАБОТАЛО...</b> (Шанс {total_chance}%, выпало {roll})\n"
+            f"{esc(inf['boss_name'])} сбросил паразита!\n"
+            f"🎯 Пити заражения увеличен до <b>+{new_pity}%</b>.",
+        )
+        await callback.answer("Неудача, Пити вырос!")
+
+
+# ==============================================================================
+# 8. ЛАБОРАТОРИЯ ПАРАЗИТОВ И КРЕЙТЫ (С БАННЕРАМИ И SHINY)
+# ==============================================================================
+
+async def render_lab_and_crates(target: Message | CallbackQuery, user_id: int):
+    u = await db.get_user(user_id)
+    crates = await db.list_crates(only_active=True)
+
+    cp, cb = cfg_int("p_common_price"), cfg_int("p_common_bonus")
+    up, ub = cfg_int("p_upgraded_price"), cfg_int("p_upgraded_bonus")
+    ep, eb = cfg_int("p_elite_price"), cfg_int("p_elite_bonus")
+
+    text = (
+        f"📦 <b>КРЕЙТЫ И ЛАБОРАТОРИЯ</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Монеты: <b>{u['coins']}</b>\n"
+        f"🦠 Паразиты: Обыч. <b>{u['p_common']}</b> | Улучш. <b>{u['p_upgraded']}</b> | Элит. <b>{u['p_elite']}</b>\n\n"
+        f"🧪 <b>Паразиты (прибавляются к шансу босса):</b>\n"
+        f"• 🦠 Обычный: <b>+{cb}%</b> ({cp}💰)\n"
+        f"• ☣️ Улучшенный: <b>+{ub}%</b> ({up}💰)\n"
+        f"• 💎 Элитный: <b>+{eb}%</b> ({ep}💰)\n\n"
+        f"📦 <b>Крейты (шанс ✨Shiny: {cfg_float('shiny_chance_pct')}%):</b>"
+    )
+    rows = [
+        [
+            InlineKeyboardButton(text=f"🦠 Обыч. ({cp}💰)", callback_data="lab:buy:common"),
+            InlineKeyboardButton(text=f"☣️ Улучш. ({up}💰)", callback_data="lab:buy:upgraded"),
+        ],
+        [InlineKeyboardButton(text=f"💎 Элитный паразит ({ep}💰)", callback_data="lab:buy:elite")],
+        [
+            InlineKeyboardButton(text="⚗️ 3🦠 ➔ 1☣️", callback_data="lab:craft:upgraded"),
+            InlineKeyboardButton(text="⚗️ 3☣️ ➔ 1💎", callback_data="lab:craft:elite"),
+        ],
+    ]
+    for cr in crates:
+        rows.append([InlineKeyboardButton(text=f"📦 {cr['name']} — {cr['price']} 💰", callback_data=f"cr:info:{cr['id']}")])
+
+    await render_view(target, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.message(F.text == "📦 Крейты и Лаба")
+async def menu_lab(message: Message, state: FSMContext):
+    await state.clear()
+    await render_lab_and_crates(message, message.from_user.id)
+
+
+@router.callback_query(F.data == "lab:home")
+async def cb_lab_home(callback: CallbackQuery):
+    await render_lab_and_crates(callback, callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("lab:buy:"))
+async def cb_lab_buy(callback: CallbackQuery):
+    p_key = callback.data.split(":")[2]
+    p_name, _, price, _ = get_parasite_info(p_key)
+    u = await db.get_user(callback.from_user.id)
+    if u["coins"] < price:
+        await callback.answer(f"Нужно {price} 💰!", show_alert=True)
+        return
+    await db.add_coins(u["user_id"], -price)
+    await db.add_parasite(u["user_id"], p_key, 1)
+    await callback.answer(f"✅ Куплен: {p_name}!", show_alert=True)
+    await render_lab_and_crates(callback, u["user_id"])
+
+
+@router.callback_query(F.data.startswith("lab:craft:"))
+async def cb_lab_craft(callback: CallbackQuery):
+    target = callback.data.split(":")[2]
+    src = "common" if target == "upgraded" else "upgraded"
+    u = await db.get_user(callback.from_user.id)
+    if u[PARASITES_META[src][1]] < 3:
+        await callback.answer(f"Нужно 3 шт. «{PARASITES_META[src][0]}»!", show_alert=True)
+        return
+    await db.add_parasite(u["user_id"], src, -3)
+    await db.add_parasite(u["user_id"], target, 1)
+    await callback.answer(f"⚗️ Скрафчен: {PARASITES_META[target][0]}!", show_alert=True)
+    await render_lab_and_crates(callback, u["user_id"])
+
+
+@router.callback_query(F.data.startswith("cr:info:"))
+async def cb_crate_info(callback: CallbackQuery):
+    cid = int(callback.data.split(":")[2])
+    cr = await db.get_crate(cid)
+    if not cr or not cr["active"]:
+        await callback.answer("Крейт недоступен.", show_alert=True)
+        return
+    units_map = cr["units"]
+    total_w = sum(units_map.values())
+    all_u = {str(x["id"]): x for x in await db.list_units()}
+
+    lines = [
+        f"📦 <b>{esc(cr['name'])}</b>",
+        f"<i>{esc(cr['description'])}</i>" if cr["description"] else "",
+        f"💰 Цена: <b>{cr['price']} монет</b> | ✨ Shiny: <b>{cfg_float('shiny_chance_pct')}%</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        "🎲 <b>Шансы выпадения:</b>",
+    ]
+    if total_w > 0:
+        sorted_entries = sorted(units_map.items(), key=lambda kv: kv[1], reverse=True)
+        for uid_s, w in sorted_entries:
+            u_obj = all_u.get(str(uid_s))
+            if not u_obj:
+                continue
+            r_ico = RARITIES.get(u_obj["rarity"], ("", "⚪️", 1))[1]
+            pct = (w / total_w) * 100.0
+            lines.append(f"• {r_ico} <b>{esc(u_obj['name'])}</b> — {pct:.2f}%")
+    else:
+        lines.append("<i>Крейт пуст.</i>")
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=f"Открыть x1 ({cr['price']}💰)", callback_data=f"cr:open:{cid}:1"),
+                InlineKeyboardButton(text=f"x5 ({cr['price'] * 5}💰)", callback_data=f"cr:open:{cid}:5"),
+            ],
+            [InlineKeyboardButton(text=f"Открыть x10 ({cr['price'] * 10}💰)", callback_data=f"cr:open:{cid}:10")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="lab:home")],
+        ]
+    )
+    await render_view(callback, "\n".join(x for x in lines if x != ""), kb, photo=cr.get("photo_id") or None)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cr:open:"))
+async def cb_crate_open(callback: CallbackQuery):
+    _, _, cid_s, amt_s = callback.data.split(":")
+    cid, amt = int(cid_s), int(amt_s)
+    cr = await db.get_crate(cid)
+    if not cr or not cr["active"]:
+        await callback.answer("Крейт недоступен.", show_alert=True)
+        return
+    u = await db.get_user(callback.from_user.id)
+    cost = cr["price"] * amt
+    if u["coins"] < cost:
+        await callback.answer(f"Недостаточно монет! Нужно {cost} 💰.", show_alert=True)
+        return
+
+    all_u = {str(x["id"]): x for x in await db.list_units()}
+    valid = [(all_u[k], float(v)) for k, v in cr["units"].items() if str(k) in all_u and float(v) > 0]
+    if not valid:
+        await callback.answer("В крейте нет доступных юнитов.", show_alert=True)
+        return
+
+    await db.add_coins(u["user_id"], -cost)
+    pool = [x[0] for x in valid]
+    weights = [x[1] for x in valid]
+    dropped = random.choices(pool, weights=weights, k=amt)
+
+    summary: Dict[Tuple[str, str, int], int] = {}
+    last_photo = None
+    for unit in dropped:
+        sh = roll_shiny()
+        await db.give_unit(u["user_id"], unit["id"], is_shiny=sh)
+        r_ico = RARITIES.get(unit["rarity"], ("", "⚪️", 1))[1]
+        key = (r_ico, unit["name"], sh)
+        summary[key] = summary.get(key, 0) + 1
+        if amt == 1:
+            last_photo = unit.get("photo_id") or None
+
+    lines = [f"🎉 <b>ОТКРЫТО {amt}x «{esc(cr['name'])}»</b>", "━━━━━━━━━━━━━━━━━━"]
+    for (r_ico, name, sh), cnt in summary.items():
+        sh_s = "✨ <b>SHINY</b> " if sh else ""
+        lines.append(f"• {r_ico} {sh_s}<b>{esc(name)}</b> — x{cnt}")
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=f"🔁 Ещё x{amt} ({cost}💰)", callback_data=f"cr:open:{cid}:{amt}"),
+                InlineKeyboardButton(text="🔙 К крейтам", callback_data="lab:home"),
+            ]
+        ]
+    )
+    await render_view(callback, "\n".join(lines), kb, photo=last_photo)
+    await callback.answer("🎉 Открыто!")
+
+
+# ==============================================================================
+# 9. МУЛЬТИПЛЕЕР: КООП-ЛОББИ, МИРОВОЙ БОСС И P2P-РЫНОК (80% / 20% КОМИССИЯ)
+# ==============================================================================
+
+def mp_hub_kb() -> InlineKeyboardMarkup:
+    open_cnt = sum(1 for b in ACTIVE_BATTLES.values() if not b["started"] and len(b["players"]) < 4)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"👥 Открытые Кооп-Лобби ({open_cnt})", callback_data="td:lobbies")],
+            [InlineKeyboardButton(text="🌍 Мировой Босс (Общий рейд)", callback_data="mp:wb")],
+            [InlineKeyboardButton(text="🏪 P2P Рынок игроков (80/20)", callback_data="mp:market:0")],
+        ]
+    )
+
+
+@router.message(F.text == "🌐 Мультиплеер")
+async def menu_mp(message: Message, state: FSMContext):
+    await state.clear()
+    wb = await db.get_active_world_boss()
+    wb_st = f"🟢 АКТИВЕН ({esc(wb['name'])} — {wb['current_hp']} HP)" if wb else "⚪️ Спит"
+    text = (
+        f"🌐 <b>МУЛЬТИПЛЕЕР ХАБ</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🌍 Мировой Босс: {wb_st}\n\n"
+        f"• <b>👥 Кооп-Лобби:</b> заходи в катки к другим игрокам (до 4 человек) и делите награды + заражение босса.\n"
+        f"• <b>🌍 Мировой Босс:</b> бейте общего босса всем сервером — Топ-3 получают монеты и шанс заразить его.\n"
+        f"• <b>🏪 P2P Рынок:</b> продажа редких ✨Shiny, 🦠Инфектед и прокачанных юнитов (80% продавцу, 20% комиссия)."
+    )
+    await message.answer(text, reply_markup=mp_hub_kb())
+
+
+@router.callback_query(F.data == "mp:hub")
+async def cb_mp_hub(callback: CallbackQuery):
+    wb = await db.get_active_world_boss()
+    wb_st = f"🟢 {esc(wb['name'])} ({wb['current_hp']} HP)" if wb else "⚪️ Спит"
+    await render_view(callback, f"🌐 <b>МУЛЬТИПЛЕЕР ХАБ</b>\n🌍 Мировой Босс: {wb_st}", mp_hub_kb())
+    await callback.answer()
+
+
+# --- МИРОВОЙ БОСС ---
+
+async def render_world_boss(target: Message | CallbackQuery):
+    wb = await db.get_active_world_boss()
+    if not wb:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В Мультиплеер", callback_data="mp:hub")]])
+        await render_view(target, "🌍 <b>МИРОВОЙ БОСС</b>\n\nСейчас Мировой Босс отдыхает. Ждите запуска от админа!", kb)
+        return
+    top = await db.get_world_boss_top(wb["id"], 5)
+    top_lines = [f"{i}. {format_user_link(t)} — <b>{int(t['damage'])}</b> урона" for i, t in enumerate(top, 1)]
+    text = (
+        f"🌍 <b>МИРОВОЙ БОСС: {esc(wb['name'])}</b> (🛡{wb['defense_percent']}%)\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{make_bar(wb['current_hp'], wb['max_hp'], 10, '🟥', '⬛')}\n"
+        f"❤️ HP: <b>{wb['current_hp']} / {wb['max_hp']}</b>\n\n"
+        f"🏆 <b>Топ-5 по урону:</b>\n" + ("\n".join(top_lines) if top_lines else "<i>Ударь первым!</i>")
+        + "\n\n🎁 Топ-3 при добивании получают крупные монеты и повышенный шанс заражения!"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⚔️ Ударить колодой!", callback_data="mp:wb:hit")],
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="mp:wb"), InlineKeyboardButton(text="🔙 Назад", callback_data="mp:hub")],
+        ]
+    )
+    await render_view(target, text, kb, photo=wb.get("photo_id") or None)
+
+
+@router.callback_query(F.data == "mp:wb")
+async def cb_wb(callback: CallbackQuery):
+    await render_world_boss(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "mp:wb:hit")
+async def cb_wb_hit(callback: CallbackQuery, bot: Bot):
+    wb = await db.get_active_world_boss()
+    if not wb:
+        await callback.answer("Босс уже повержен!", show_alert=True)
+        await render_world_boss(callback)
+        return
+    uid = callback.from_user.id
+    prev = await db.get_world_boss_hit(wb["id"], uid)
+    now = int(time.time())
+    cd = cfg_int("wb_cooldown_sec")
+    if prev and (now - prev["last_hit"]) < cd:
+        await callback.answer(f"⏳ Перезарядка удара: {cd - (now - prev['last_hit'])} сек.", show_alert=True)
+        return
+    deck = await db.get_inventory(uid, only_equipped=True)
+    if not deck:
+        await callback.answer("Сначала наденьте юнитов в колоду!", show_alert=True)
+        return
+
+    # Урон = суммарный 10-секундный залп колоды с учётом брони Мирового Босса
+    raw_dps = sum(calc_unit_battle_stats(c, 1)["dps"] for c in deck)
+    dmg = max(10.0, round(raw_dps * 10.0 * (1.0 - wb["defense_percent"] / 100.0) * random.uniform(0.9, 1.15), 1))
+    rem = await db.hit_world_boss(wb["id"], uid, dmg)
+
+    # Юниты тоже получают XP за удар по Мировому Боссу!
+    per_unit_xp = round((dmg / len(deck)) * UNIT_XP_PER_DAMAGE, 2)
+    for c in deck:
+        nl, nx, _ = apply_unit_xp(c["level"], c["xp"], per_unit_xp)
+        await db.update_inv_progress(c["inv_id"], nl, nx)
+
+    if rem <= 0:
+        top = await db.get_world_boss_top(wb["id"], 10)
+        reward_u = await db.get_unit(wb["infected_unit_id"]) if wb.get("infected_unit_id") else None
+        for idx, part in enumerate(top, 1):
+            p_uid = part["user_id"]
+            coins = int(max(150, 900 - (idx - 1) * 140) * cfg_float("event_coin_mult"))
+            await db.add_coins(p_uid, coins)
+            extra = ""
+            if idx <= 3 and reward_u and random.randint(1, 100) <= min(75, wb["infect_chance"] + 25):
+                sh = roll_shiny()
+                await db.give_unit(p_uid, reward_u["id"], is_shiny=sh, is_infected=1)
+                extra = f"\n🦠 <b>ВЫ ЗАРАЗИЛИ МИРОВОГО БОССА!</b> Получен: <b>{esc(reward_u['name'])}</b>{' ✨SHINY!' if sh else ''}"
+            try:
+                await bot.send_message(
+                    p_uid,
+                    f"🌍🏆 <b>МИРОВОЙ БОСС {esc(wb['name'])} ПОВЕРЖЕН!</b>\n"
+                    f"Место: <b>#{idx}</b> (урон: {int(part['damage'])}) | 💰 <b>+{coins}</b>{extra}",
+                )
+            except Exception:
+                pass
+        await callback.answer(f"💥 ФИНАЛЬНЫЙ УДАР -{int(dmg)}! Босс повержен!", show_alert=True)
+    else:
+        await callback.answer(f"⚔️ Нанесено {int(dmg)} урона! Осталось {rem} HP.", show_alert=True)
+    await render_world_boss(callback)
+
+
+# --- P2P РЫНОК (80% продавцу, 20% комиссия владельцу) ---
+
+async def render_market_page(target: Message | CallbackQuery, user_id: int, page: int = 0):
+    lots = await db.list_market()
+    per_page = 6
+    total_pages = max(1, (len(lots) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    chunk = lots[page * per_page : (page + 1) * per_page]
+
+    text = (
+        f"🏪 <b>P2P РЫНОК ИГРОКОВ</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Комиссия рынка: <b>{MARKET_COMMISSION_PCT}%</b> (продавец получает <b>80%</b>).\n"
+        f"Лотов: <b>{len(lots)}</b> | Стр. {page + 1}/{total_pages}"
+    )
+    rows = []
+    for lot in chunk:
+        r_ico = RARITIES.get(lot["rarity"], ("", "⚪️", 1))[1]
+        b = unit_badges(lot)
+        mine = " (Мой)" if lot["seller_id"] == user_id else ""
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{r_ico}{b} {lot['name']} Ур.{lot['level']} — {lot['price']}💰{mine}",
+                callback_data=f"mkt:v:{lot['market_id']}:{page}",
+            )
+        ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"mp:market:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"mp:market:{page + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔙 В Мультиплеер", callback_data="mp:hub")])
+    await render_view(target, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("mp:market:"))
+async def cb_market_page(callback: CallbackQuery):
+    await render_market_page(callback, callback.from_user.id, int(callback.data.split(":")[2]))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mkt:v:"))
+async def cb_market_view(callback: CallbackQuery):
+    _, _, lot_s, page_s = callback.data.split(":")
+    lot_id, page = int(lot_s), int(page_s)
+    lot = next((x for x in await db.list_market() if x["market_id"] == lot_id), None)
+    if not lot:
+        await callback.answer("Лот больше не существует.", show_alert=True)
+        await render_market_page(callback, callback.from_user.id, page)
+        return
+    st = calc_unit_battle_stats(lot, 1)
+    text = (
+        f"🏷 <b>ЛОТ #{lot['market_id']}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🃏 <b>{esc(lot['name'])}</b> {unit_badges(lot)} (Ур. {lot['level']}/{MAX_UNIT_LEVEL})\n"
+        f"🏷 Классы: <b>{', '.join(st['classes'])}</b>\n"
+        f"⚔️ Урон: <b>{st['damage']}</b> | ⏱ {st['cd']}с | ⚡ DPS: <b>{st['dps']}/с</b> | 💰 Поставка: <b>{st['deploy_cost']}</b>\n"
+        f"✍️ Сигна: {get_sign_label(lot)}\n"
+        f"👤 Продавец: <b>{esc(lot['seller_name'] or 'Игрок')}</b>\n"
+        f"💰 Цена: <b>{lot['price']} монет</b>"
+    )
+    act = (
+        InlineKeyboardButton(text="❌ Снять с продажи", callback_data=f"mkt:c:{lot_id}:{page}")
+        if lot["seller_id"] == callback.from_user.id
+        else InlineKeyboardButton(text=f"✅ Купить за {lot['price']} 💰", callback_data=f"mkt:b:{lot_id}:{page}")
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[act], [InlineKeyboardButton(text="🔙 Назад", callback_data=f"mp:market:{page}")]])
+    await render_view(callback, text, kb, photo=lot.get("photo_id") or None)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mkt:b:"))
+async def cb_market_buy(callback: CallbackQuery, bot: Bot):
+    _, _, lot_s, page_s = callback.data.split(":")
+    ok, msg, lot = await db.buy_market_lot(int(lot_s), callback.from_user.id)
+    await callback.answer(msg, show_alert=True)
+    if ok and lot:
+        try:
+            await bot.send_message(
+                lot["seller_id"],
+                f"💰 <b>ВАШЕГО ЮНИТА КУПИЛИ НА РЫНКЕ!</b>\n"
+                f"Юнит: <b>{esc(lot['name'])}</b>\n"
+                f"Цена сделки: {lot['price']} 💰 | Зачислено вам (80%): <b>+{lot['seller_payout']} 💰</b>",
+            )
+        except Exception:
+            pass
+    await render_market_page(callback, callback.from_user.id, int(page_s))
+
+
+@router.callback_query(F.data.startswith("mkt:c:"))
+async def cb_market_cancel(callback: CallbackQuery):
+    _, _, lot_s, page_s = callback.data.split(":")
+    ok = await db.cancel_market_lot(int(lot_s), callback.from_user.id)
+    await callback.answer("Лот снят!" if ok else "Ошибка.", show_alert=True)
+    await render_market_page(callback, callback.from_user.id, int(page_s))
+
+
+# ==============================================================================
+# 10. РЕЙТИНГИ
+# ==============================================================================
+
+async def render_top(target: Message | CallbackQuery, mode: str = "wins"):
+    meta = {
+        "wins": ("🏆 Топ по Победам в катках", "побед"),
+        "total_damage": ("💥 Топ по Общему Урону", "урона"),
+        "infections_success": ("🦠 Топ по Заражениям", "зараж."),
+        "bosses_killed": ("👹 Топ Охотников на Боссов", "боссов"),
+        "coins": ("💰 Топ Богачей", "монет"),
+    }
+    title, unit = meta.get(mode, meta["wins"])
+    rows_db = await db.get_leaderboard(mode, 10)
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [f"<b>{title}</b>", "━━━━━━━━━━━━━━━━━━"]
+    for i, r in enumerate(rows_db, 1):
+        m = medals[i - 1] if i <= 3 else f"<b>{i}.</b>"
+        val = int(r["val"])
+        lines.append(f"{m} {format_user_link(r)} — <b>{val}</b> {unit}")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🏆 Победы", callback_data="top:wins"),
+                InlineKeyboardButton(text="💥 Урон", callback_data="top:total_damage"),
+                InlineKeyboardButton(text="🦠 Зараж.", callback_data="top:infections_success"),
+            ],
+            [
+                InlineKeyboardButton(text="👹 Боссы", callback_data="top:bosses_killed"),
+                InlineKeyboardButton(text="💰 Монеты", callback_data="top:coins"),
+            ],
+        ]
+    )
+    await render_view(target, "\n".join(lines), kb)
+
+
+@router.message(F.text == "🏆 Рейтинг")
+async def menu_top(message: Message, state: FSMContext):
+    await state.clear()
+    await render_top(message, "wins")
+
+
+@router.callback_query(F.data.startswith("top:"))
+async def cb_top(callback: CallbackQuery):
+    await render_top(callback, callback.data.split(":")[1])
+    await callback.answer()
+
+
+# ==============================================================================
+# 11. РАСШИРЕННАЯ АДМИН-ПАНЕЛЬ (ГРАНУЛЯРНЫЕ ПРАВА + ВСЕ КОНСТРУКТОРЫ)
+# ==============================================================================
+
+async def render_admin_home(target: Message | CallbackQuery, uid: int):
+    perms = await db.get_admin_perms(uid)
+    st = await db.get_global_stats()
+    maint = "🔴 ВКЛ" if GAME_SETTINGS.get("maintenance") == "1" else "🟢 ВЫКЛ"
+    text = (
+        f"⚙️ <b>АДМИН-ПАНЕЛЬ SKIBIDI VERSE TD</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Игроков: <b>{st['users']}</b> | 🃏 Юнитов: <b>{st['units']}</b> | 👾 Мобов: <b>{st['mobs']}</b>\n"
+        f"🗺 Карт: <b>{st['maps']}</b> | 📦 Крейтов: <b>{st['crates']}</b> | 🏪 Рынок: <b>{st['market']}</b>\n"
+        f"🛠 Техработы: <b>{maint}</b>"
+    )
+    rows = []
+    r1 = []
+    if perms.get("manage_units"):
+        r1.append(InlineKeyboardButton(text="🃏 Юниты", callback_data="adm:units:0"))
+    if perms.get("manage_mobs"):
+        r1.append(InlineKeyboardButton(text="👾 Мобы", callback_data="adm:mobs:0"))
+    if r1:
+        rows.append(r1)
+
+    r2 = []
+    if perms.get("manage_maps"):
+        r2.append(InlineKeyboardButton(text="🗺 Карты и Волны", callback_data="adm:maps:0"))
+    if perms.get("manage_crates"):
+        r2.append(InlineKeyboardButton(text="📦 Крейты", callback_data="adm:crates:0"))
+    if r2:
+        rows.append(r2)
+
+    r3 = []
+    if perms.get("manage_settings"):
+        r3.append(InlineKeyboardButton(text="🎛 Настройки баланса", callback_data="adm:set:0"))
+    if perms.get("manage_bosses"):
+        r3.append(InlineKeyboardButton(text="🌍 Мировой Босс", callback_data="adm:wb"))
+    if r3:
+        rows.append(r3)
+
+    r4 = []
+    if perms.get("manage_users") or perms.get("manage_economy"):
+        r4.append(InlineKeyboardButton(text="👥 Игроки и Выдача", callback_data="adm:users"))
+    if perms.get("broadcast"):
+        r4.append(InlineKeyboardButton(text="📢 Рассылка", callback_data="adm:bcast"))
+    if r4:
+        rows.append(r4)
+
+    if perms.get("manage_admins"):
+        rows.append([
+            InlineKeyboardButton(text="👮 Админы", callback_data="adm:admins"),
+            InlineKeyboardButton(text="🤝 Партнёры", callback_data="adm:signers"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text=f"🛠 Техработы ({maint})", callback_data="adm:maint"),
+            InlineKeyboardButton(text="💾 Бэкап БД", callback_data="adm:backup"),
+        ])
+        rows.append([InlineKeyboardButton(text="📋 Логи админов", callback_data="adm:logs")])
+
+    await render_view(target, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.message(F.text == "⚙️ Админ-панель")
+async def menu_admin(message: Message, state: FSMContext, is_admin: bool):
+    if not is_admin:
+        return
+    await state.clear()
+    await render_admin_home(message, message.from_user.id)
+
+
+@router.callback_query(F.data == "adm:home")
+async def cb_adm_home(callback: CallbackQuery, state: FSMContext):
+    if not await db.is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа!", show_alert=True)
+        return
+    await state.clear()
+    await render_admin_home(callback, callback.from_user.id)
+    await callback.answer()
+
+
+# ==================== АДМИН: ЮНИТЫ (СОЗДАНИЕ, РЕДАКТОР, ТИРЫ, КНОКБЕК) ====================
+
+async def render_adm_units(target: Message | CallbackQuery, page: int = 0):
+    units = await db.list_units()
+    per_page = 6
+    total_pages = max(1, (len(units) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    chunk = units[page * per_page : (page + 1) * per_page]
+
+    rows = [[InlineKeyboardButton(text="➕ Создать нового Юнита", callback_data="au:new")]]
+    for u in chunk:
+        r_ico = RARITIES.get(u["rarity"], ("", "⚪️", 1))[1]
+        rows.append([InlineKeyboardButton(text=f"{r_ico} #{u['id']} {u['name']} (⚔️{u['damage']} | 💰{u['deploy_cost']})", callback_data=f"au:ed:{u['id']}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:units:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm:units:{page + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")])
+    await render_view(target, f"🃏 <b>УПРАВЛЕНИЕ ЮНИТАМИ</b> (Всего: {len(units)})", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("adm:units:"))
+async def cb_adm_units(callback: CallbackQuery):
+    if not await db.has_perm(callback.from_user.id, "manage_units"):
+        await callback.answer("Нет прав manage_units!", show_alert=True)
+        return
+    await render_adm_units(callback, int(callback.data.split(":")[2]))
+    await callback.answer()
+
+
+def unit_classes_kb(selected: List[str], prefix: str) -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for c in UNIT_CLASSES:
+        mark = "✅" if c in selected else "⬜"
+        row.append(InlineKeyboardButton(text=f"{mark} {c}", callback_data=f"{prefix}:{c}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="💾 Готово / Далее", callback_data=f"{prefix}:DONE")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "au:new")
+async def cb_au_new(callback: CallbackQuery, state: FSMContext):
+    if not await db.has_perm(callback.from_user.id, "manage_units"):
+        await callback.answer("Нет прав!", show_alert=True)
+        return
+    await state.set_state(UnitCreateFSM.classes)
+    await state.update_data(classes=[])
+    await render_view(callback, "🃏 <b>Создание Юнита — Шаг 1</b>\nВыберите классы (можно несколько, включая <b>Кнокбек</b>):", unit_classes_kb([], "ucls"))
+    await callback.answer()
+
+
+@router.callback_query(UnitCreateFSM.classes, F.data.startswith("ucls:"))
+async def fsm_au_classes(callback: CallbackQuery, state: FSMContext):
+    val = callback.data.split(":")[1]
+    data = await state.get_data()
+    cls = list(data.get("classes", []))
+    if val == "DONE":
+        if not cls:
+            await callback.answer("Выберите хотя бы 1 класс!", show_alert=True)
+            return
+        await state.set_state(UnitCreateFSM.name)
+        await callback.message.answer("📝 Введите <b>название</b> юнита:")
+        await callback.answer()
+        return
+    if val in cls:
+        cls.remove(val)
+    else:
+        cls.append(val)
+    await state.update_data(classes=cls)
+    await callback.message.edit_reply_markup(reply_markup=unit_classes_kb(cls, "ucls"))
+    await callback.answer()
+
+
+@router.message(UnitCreateFSM.name)
+async def fsm_au_name(message: Message, state: FSMContext):
+    await state.update_data(name=(message.text or "").strip())
+    await state.set_state(UnitCreateFSM.faction)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=v, callback_data=f"ufac:{k}")] for k, v in FACTIONS.items()])
+    await message.answer("🏷 Выберите <b>фракцию</b>:", reply_markup=kb)
+
+
+@router.callback_query(UnitCreateFSM.faction, F.data.startswith("ufac:"))
+async def fsm_au_faction(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(faction=callback.data.split(":")[1])
+    await state.set_state(UnitCreateFSM.rarity)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{ico} {n}", callback_data=f"urar:{k}")] for k, (n, ico, _) in RARITIES.items()])
+    await render_view(callback, "🌟 Выберите <b>редкость</b>:", kb)
+    await callback.answer()
+
+
+@router.callback_query(UnitCreateFSM.rarity, F.data.startswith("urar:"))
+async def fsm_au_rarity(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(rarity=callback.data.split(":")[1])
+    await state.set_state(UnitCreateFSM.photo)
+    await callback.message.answer("🖼 Отправьте <b>фото</b> юнита (или напишите <code>-</code> чтобы пропустить):")
+    await callback.answer()
+
+
+@router.message(UnitCreateFSM.photo)
+async def fsm_au_photo(message: Message, state: FSMContext):
+    pid = message.photo[-1].file_id if message.photo else ""
+    await state.update_data(photo_id=pid)
+    await state.set_state(UnitCreateFSM.deploy_cost)
+    await message.answer("💰 Введите <b>цену поставки</b> и <b>лимит на поле</b> через пробел (например: <code>120 4</code>):")
+
+
+@router.message(UnitCreateFSM.deploy_cost)
+async def fsm_au_cost_limit(message: Message, state: FSMContext):
+    parts = (message.text or "").split()
+    try:
+        cost = int(parts[0])
+        lim = int(parts[1]) if len(parts) > 1 else 4
+    except (ValueError, IndexError):
+        await message.answer("❌ Введите два числа, например: <code>120 4</code>")
+        return
+    await state.update_data(deploy_cost=cost, supply_limit=lim)
+    await _au_next_class_step(message, state)
+
+
+async def _au_next_class_step(message: Message, state: FSMContext):
+    d = await state.get_data()
+    cls = d.get("classes", [])
+    if any(c in ATTACKING_CLASSES for c in cls) and "damage" not in d:
+        await state.set_state(UnitCreateFSM.atk_stats)
+        await message.answer("⚔️ Введите <b>Урон</b> и <b>КД (сек)</b> через пробел (например: <code>45 1.3</code>):")
+        return
+    if "Саппорт" in cls and "cd_boost" not in d:
+        await state.set_state(UnitCreateFSM.support_stats)
+        await message.answer("✨ <b>[Саппорт]</b> Введите <b>множитель КД</b> и <b>множитель Урона</b> через пробел (например: <code>0.85 1.25</code>):")
+        return
+    if "Ферма" in cls and "income" not in d:
+        await state.set_state(UnitCreateFSM.farm_income)
+        await message.answer("🌾 <b>[Ферма]</b> Введите доход монет за волну (число, например <code>60</code>):")
+        return
+    if "Замедление" in cls and "slow_percent" not in d:
+        await state.set_state(UnitCreateFSM.slow_stats)
+        await message.answer("❄️ <b>[Замедление]</b> Введите <b>% замедления</b>, <b>длительность (ходы)</b> и <b>КД (сек)</b> через пробел (например: <code>25 2 10</code>):")
+        return
+    if "Оглушение" in cls and "stun_chance" not in d:
+        await state.set_state(UnitCreateFSM.stun_stats)
+        await message.answer("⚡ <b>[Оглушение]</b> Введите <b>шанс %</b> и <b>длительность (ходы)</b> через пробел (например: <code>20 1</code>):")
+        return
+    if "Горение" in cls and "burn_chance" not in d:
+        await state.set_state(UnitCreateFSM.burn_stats)
+        await message.answer("🔥 <b>[Горение]</b> Введите <b>шанс %</b>, <b>урон/ход</b> и <b>длительность (ходы)</b> (например: <code>40 20 3</code>):")
+        return
+    if "Кнокбек" in cls and "knockback_power" not in d:
+        await state.set_state(UnitCreateFSM.knockback_power)
+        await message.answer("💨 <b>[Кнокбек]</b> Введите силу отталкивания (любое число, например <code>4</code>, <code>6</code>, <code>8</code>):")
+        return
+
+    await state.set_state(UnitCreateFSM.description)
+    await message.answer("📝 Введите короткое <b>описание</b> юнита (или <code>-</code>):")
+
+
+@router.message(UnitCreateFSM.atk_stats)
+async def fsm_au_atk(message: Message, state: FSMContext):
+    p = (message.text or "").replace(",", ".").split()
+    try:
+        dmg, cd = float(p[0]), float(p[1])
+    except (ValueError, IndexError):
+        await message.answer("❌ Пример: <code>45 1.3</code>")
+        return
+    await state.update_data(damage=dmg, cd=cd)
+    await _au_next_class_step(message, state)
+
+
+@router.message(UnitCreateFSM.support_stats)
+async def fsm_au_sup(message: Message, state: FSMContext):
+    p = (message.text or "").replace(",", ".").split()
+    try:
+        cb, db_ = float(p[0]), float(p[1])
+    except (ValueError, IndexError):
+        await message.answer("❌ Пример: <code>0.85 1.25</code>")
+        return
+    await state.update_data(cd_boost=cb, dmg_boost=db_)
+    await _au_next_class_step(message, state)
+
+
+@router.message(UnitCreateFSM.farm_income)
+async def fsm_au_farm(message: Message, state: FSMContext):
+    try:
+        inc = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("❌ Введите число.")
+        return
+    await state.update_data(income=inc)
+    await _au_next_class_step(message, state)
+
+
+@router.message(UnitCreateFSM.slow_stats)
+async def fsm_au_slow(message: Message, state: FSMContext):
+    p = (message.text or "").replace(",", ".").split()
+    try:
+        sp, sd, scd = int(p[0]), float(p[1]), float(p[2])
+    except (ValueError, IndexError):
+        await message.answer("❌ Пример: <code>25 2 10</code>")
+        return
+    await state.update_data(slow_percent=sp, slow_duration=sd, slow_cd=scd)
+    await _au_next_class_step(message, state)
+
+
+@router.message(UnitCreateFSM.stun_stats)
+async def fsm_au_stun(message: Message, state: FSMContext):
+    p = (message.text or "").split()
+    try:
+        sc, sd = int(p[0]), int(p[1])
+    except (ValueError, IndexError):
+        await message.answer("❌ Пример: <code>20 1</code>")
+        return
+    await state.update_data(stun_chance=sc, stun_duration=sd)
+    await _au_next_class_step(message, state)
+
+
+@router.message(UnitCreateFSM.burn_stats)
+async def fsm_au_burn(message: Message, state: FSMContext):
+    p = (message.text or "").replace(",", ".").split()
+    try:
+        bc, bd, bdur = int(p[0]), float(p[1]), int(p[2])
+    except (ValueError, IndexError):
+        await message.answer("❌ Пример: <code>40 20 3</code>")
+        return
+    await state.update_data(burn_chance=bc, burn_damage=bd, burn_duration=bdur)
+    await _au_next_class_step(message, state)
+
+
+@router.message(UnitCreateFSM.knockback_power)
+async def fsm_au_kb(message: Message, state: FSMContext):
+    try:
+        kp = float((message.text or "").replace(",", ".").strip())
+    except ValueError:
+        await message.answer("❌ Введите число (например <code>4</code> или <code>6</code>).")
+        return
+    await state.update_data(knockback_power=kp)
+    await _au_next_class_step(message, state)
+
+
+@router.message(UnitCreateFSM.description)
+async def fsm_au_desc(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    await state.update_data(description="" if txt == "-" else txt)
+    d = await state.get_data()
+    uid_new = await db.create_unit(d)
+    await db.log_admin(message.from_user.id, f"Создал юнита #{uid_new} {d['name']}")
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✏️ Редактировать / Добавить Тиры", callback_data=f"au:ed:{uid_new}:0")]])
+    await message.answer(f"✅ Юнит <b>{esc(d['name'])}</b> (#{uid_new}) успешно создан!", reply_markup=kb)
+
+
+async def render_adm_unit_editor(target: Message | CallbackQuery, unit_id: int, page: int):
+    u = await db.get_unit(unit_id)
+    if not u:
+        await render_adm_units(target, page)
+        return
+    fake_item = {**u, "level": 1, "xp": 0, "is_shiny": 0, "is_infected": 0, "sign_type": "none", "signed_by": "", "equip_slot": 0}
+    txt = f"🛠 <b>РЕДАКТОР ЮНИТА #{u['id']}</b>\n" + format_unit_info_card(fake_item, 0, 0, False)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Имя", callback_data=f"au:f:{unit_id}:name:{page}"), InlineKeyboardButton(text="🖼 Фото", callback_data=f"au:f:{unit_id}:photo_id:{page}")],
+            [InlineKeyboardButton(text="⚔️ Урон", callback_data=f"au:f:{unit_id}:damage:{page}"), InlineKeyboardButton(text="⏱ КД", callback_data=f"au:f:{unit_id}:cd:{page}")],
+            [InlineKeyboardButton(text="💰 Цена", callback_data=f"au:f:{unit_id}:deploy_cost:{page}"), InlineKeyboardButton(text="🛑 Лимит", callback_data=f"au:f:{unit_id}:supply_limit:{page}")],
+            [InlineKeyboardButton(text="💨 Кнокбек", callback_data=f"au:f:{unit_id}:knockback_power:{page}"), InlineKeyboardButton(text="🌾 Ферма", callback_data=f"au:f:{unit_id}:income:{page}")],
+            [InlineKeyboardButton(text="🌟 Редкость", callback_data=f"au:f:{unit_id}:rarity:{page}"), InlineKeyboardButton(text="🏷 Классы", callback_data=f"au:cls:{unit_id}:{page}")],
+            [InlineKeyboardButton(text="⬆️ Настроить Тиры (2..4)", callback_data=f"au:upg:{unit_id}:{page}")],
+            [InlineKeyboardButton(text="🗑 Удалить юнита", callback_data=f"au:del:{unit_id}:{page}")],
+            [InlineKeyboardButton(text="🔙 К юнитам", callback_data=f"adm:units:{page}")],
+        ]
+    )
+    await render_view(target, txt, kb, photo=u.get("photo_id") or None)
+
+
+@router.callback_query(F.data.startswith("au:ed:"))
+async def cb_au_ed(callback: CallbackQuery):
+    _, _, u_s, p_s = callback.data.split(":")
+    await render_adm_unit_editor(callback, int(u_s), int(p_s))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("au:f:"))
+async def cb_au_field(callback: CallbackQuery, state: FSMContext):
+    _, _, u_s, field, p_s = callback.data.split(":")
+    await state.set_state(UnitEditFSM.waiting_value)
+    await state.update_data(unit_id=int(u_s), field=field, page=int(p_s))
+    hint = "Отправьте новое фото (или `-`):" if field == "photo_id" else (
+        f"Введите редкость ({', '.join(RARITIES.keys())}):" if field == "rarity" else f"Введите новое значение для <b>{field}</b>:"
+    )
+    await callback.message.answer(hint)
+    await callback.answer()
+
+
+@router.message(UnitEditFSM.waiting_value)
+async def fsm_au_field_save(message: Message, state: FSMContext):
+    d = await state.get_data()
+    await state.clear()
+    uid_e, field, page = d["unit_id"], d["field"], d["page"]
+    try:
+        if field == "photo_id":
+            val: Any = message.photo[-1].file_id if message.photo else ""
+        elif field in ("deploy_cost", "supply_limit", "income"):
+            val = int((message.text or "").strip())
+        elif field in ("damage", "cd", "knockback_power"):
+            val = float((message.text or "").replace(",", ".").strip())
+        elif field == "rarity":
+            val = (message.text or "").strip().lower()
+            if val not in RARITIES:
+                raise ValueError
+        else:
+            val = (message.text or "").strip()
+    except ValueError:
+        await message.answer("❌ Неверный формат значения.")
+        return
+    await db.update_unit(uid_e, **{field: val})
+    await db.log_admin(message.from_user.id, f"Изменил юнита #{uid_e}: {field}")
+    await message.answer("✅ Сохранено!")
+    await render_adm_unit_editor(message, uid_e, page)
+
+
+@router.callback_query(F.data.startswith("au:cls:"))
+async def cb_au_cls_open(callback: CallbackQuery, state: FSMContext):
+    _, _, u_s, p_s = callback.data.split(":")
+    u = await db.get_unit(int(u_s))
+    if not u:
+        return
+    await state.update_data(ed_u_id=u["id"], ed_u_page=int(p_s), ed_u_cls=list(u["classes"]))
+    await render_view(callback, f"🏷 Классы для <b>{esc(u['name'])}</b>:", unit_classes_kb(u["classes"], "eucls"))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("eucls:"))
+async def cb_eucls_toggle(callback: CallbackQuery, state: FSMContext):
+    val = callback.data.split(":")[1]
+    d = await state.get_data()
+    cls = list(d.get("ed_u_cls", []))
+    if val == "DONE":
+        await db.update_unit(d["ed_u_id"], classes=cls or ["Одиночный"])
+        await state.clear()
+        await render_adm_unit_editor(callback, d["ed_u_id"], d["ed_u_page"])
+        await callback.answer("✅ Классы сохранены!")
+        return
+    if val in cls:
+        cls.remove(val)
+    else:
+        cls.append(val)
+    await state.update_data(ed_u_cls=cls)
+    await callback.message.edit_reply_markup(reply_markup=unit_classes_kb(cls, "eucls"))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("au:upg:"))
+async def cb_au_upg(callback: CallbackQuery, state: FSMContext):
+    _, _, u_s, p_s = callback.data.split(":")
+    await state.set_state(UnitEditFSM.upg_tier)
+    await state.update_data(upg_u_id=int(u_s), upg_page=int(p_s))
+    await callback.message.answer(
+        "⬆️ <b>Настройка Тира апгрейда в катке</b>\n"
+        "Введите номер тира (например <code>2</code>, <code>3</code> или <code>4</code>):"
+    )
+    await callback.answer()
+
+
+@router.message(UnitEditFSM.upg_tier)
+async def fsm_au_upg_tier(message: Message, state: FSMContext):
+    try:
+        tier = int((message.text or "").strip())
+        if not (2 <= tier <= 6):
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите число от 2 до 6.")
+        return
+    await state.update_data(upg_tier=tier)
+    await state.set_state(UnitEditFSM.upg_data)
+    await message.answer(
+        f"Введите параметры для <b>Тира {tier}</b> в формате:\n"
+        f"<code>цена урон кд кнокбек доход</code>\n"
+        f"Ставьте <code>-</code>, если параметр не меняется (пример: <code>250 80 1.1 6 -</code>):"
+    )
+
+
+@router.message(UnitEditFSM.upg_data)
+async def fsm_au_upg_save(message: Message, state: FSMContext):
+    d = await state.get_data()
+    await state.clear()
+    parts = (message.text or "").replace(",", ".").split()
+    try:
+        entry: Dict[str, Any] = {"cost": int(parts[0])}
+        if len(parts) > 1 and parts[1] != "-":
+            entry["damage"] = float(parts[1])
+        if len(parts) > 2 and parts[2] != "-":
+            entry["cd"] = float(parts[2])
+        if len(parts) > 3 and parts[3] != "-":
+            entry["knockback_power"] = float(parts[3])
+        if len(parts) > 4 and parts[4] != "-":
+            entry["income"] = int(parts[4])
+    except (ValueError, IndexError):
+        await message.answer("❌ Неверный формат! Пример: <code>250 80 1.1 - -</code>")
+        return
+    u = await db.get_unit(d["upg_u_id"])
+    upgs = dict(u["upgrades"])
+    upgs[str(d["upg_tier"])] = entry
+    await db.update_unit(u["id"], upgrades=upgs)
+    await message.answer(f"✅ Тир {d['upg_tier']} сохранён!")
+    await render_adm_unit_editor(message, u["id"], d["upg_page"])
+
+
+@router.callback_query(F.data.startswith("au:del:"))
+async def cb_au_del(callback: CallbackQuery):
+    _, _, u_s, p_s = callback.data.split(":")
+    await db.delete_unit(int(u_s))
+    await db.log_admin(callback.from_user.id, f"Удалил юнита #{u_s}")
+    await callback.answer("🗑 Юнит удалён!", show_alert=True)
+    await render_adm_units(callback, int(p_s))
+
+
+# ==================== АДМИН: МОБЫ (ТОЛЬКО HP, % БРОНИ, БОСС И ЗАРАЖЕНИЕ) ====================
+
+async def render_adm_mobs(target: Message | CallbackQuery, page: int = 0):
+    mobs = await db.list_mobs()
+    per_page = 6
+    total_pages = max(1, (len(mobs) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    chunk = mobs[page * per_page : (page + 1) * per_page]
+
+    rows = [[InlineKeyboardButton(text="➕ Создать нового Моба", callback_data="am:new")]]
+    for m in chunk:
+        ico = "👑" if m["is_boss"] else "👾"
+        rows.append([InlineKeyboardButton(text=f"{ico} #{m['id']} {m['name']} (❤️{m['hp']} | 🛡{m['defense_percent']}%)", callback_data=f"am:ed:{m['id']}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:mobs:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm:mobs:{page + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")])
+    await render_view(target, f"👾 <b>УПРАВЛЕНИЕ МОБАМИ</b> (Всего: {len(mobs)})", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("adm:mobs:"))
+async def cb_adm_mobs(callback: CallbackQuery):
+    if not await db.has_perm(callback.from_user.id, "manage_mobs"):
+        await callback.answer("Нет прав manage_mobs!", show_alert=True)
+        return
+    await render_adm_mobs(callback, int(callback.data.split(":")[2]))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "am:new")
+async def cb_am_new(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(MobCreateFSM.name)
+    await callback.message.answer("👾 Введите <b>название</b> моба:")
+    await callback.answer()
+
+
+@router.message(MobCreateFSM.name)
+async def fsm_am_name(message: Message, state: FSMContext):
+    await state.update_data(name=(message.text or "").strip())
+    await state.set_state(MobCreateFSM.hp)
+    await message.answer("❤️ Введите <b>HP моба</b> и <b>% брони</b> через пробел (например: <code>500 20</code>, без брони — <code>500 0</code>):")
+
+
+@router.message(MobCreateFSM.hp)
+async def fsm_am_hp_def(message: Message, state: FSMContext):
+    p = (message.text or "").split()
+    try:
+        hp = int(p[0])
+        df = max(0, min(90, int(p[1]) if len(p) > 1 else 0))
+    except (ValueError, IndexError):
+        await message.answer("❌ Пример: <code>500 20</code>")
+        return
+    await state.update_data(hp=hp, defense_percent=df)
+    await state.set_state(MobCreateFSM.photo)
+    await message.answer("🖼 Отправьте <b>фото</b> моба (или <code>-</code>):")
+
+
+@router.message(MobCreateFSM.photo)
+async def fsm_am_photo(message: Message, state: FSMContext):
+    pid = message.photo[-1].file_id if message.photo else ""
+    await state.update_data(photo_id=pid)
+    await state.set_state(MobCreateFSM.is_boss)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👑 Да, Босс (заражаемый)", callback_data="amb:1"), InlineKeyboardButton(text="👾 Обычный моб", callback_data="amb:0")]])
+    await message.answer("Этот моб является <b>Боссом</b> с механикой заражения?", reply_markup=kb)
+
+
+@router.callback_query(MobCreateFSM.is_boss, F.data.startswith("amb:"))
+async def fsm_am_boss(callback: CallbackQuery, state: FSMContext):
+    is_b = int(callback.data.split(":")[1])
+    await state.update_data(is_boss=is_b)
+    if is_b == 0:
+        d = await state.get_data()
+        mid = await db.create_mob(d)
+        await db.log_admin(callback.from_user.id, f"Создал моба #{mid} {d['name']}")
+        await state.clear()
+        await render_view(callback, f"✅ Моб <b>{esc(d['name'])}</b> (#{mid}) создан!")
+        await callback.answer()
+        return
+    units = await db.list_units()
+    hint = "\n".join(f"<code>{u['id']}</code> — {esc(u['name'])}" for u in units[-12:])
+    await state.set_state(MobCreateFSM.infect_cfg)
+    await callback.message.answer(
+        f"🦠 Введите <b>базовый шанс заражения (%)</b> и <b>ID заражённого юнита</b> через пробел (например: <code>1 8</code>):\n\n{hint}"
+    )
+    await callback.answer()
+
+
+@router.message(MobCreateFSM.infect_cfg)
+async def fsm_am_inf(message: Message, state: FSMContext):
+    p = (message.text or "").split()
+    try:
+        ch, uid_inf = int(p[0]), int(p[1])
+    except (ValueError, IndexError):
+        await message.answer("❌ Пример: <code>1 8</code>")
+        return
+    await state.update_data(infect_chance=ch, infected_unit_id=uid_inf)
+    d = await state.get_data()
+    mid = await db.create_mob(d)
+    await db.log_admin(message.from_user.id, f"Создал босса #{mid} {d['name']}")
+    await state.clear()
+    await message.answer(f"✅ Босс <b>{esc(d['name'])}</b> (#{mid}) создан! (Баз. шанс заражения: {ch}%)")
+
+
+async def render_adm_mob_editor(target: Message | CallbackQuery, mob_id: int, page: int):
+    m = await db.get_mob(mob_id)
+    if not m:
+        await render_adm_mobs(target, page)
+        return
+    txt = (
+        f"👾 <b>МОБ #{m['id']} — {esc(m['name'])}</b>\n"
+        f"❤️ HP: <b>{m['hp']}</b> | 🛡 Броня: <b>{m['defense_percent']}%</b>\n"
+        f"👑 Босс: <b>{'Да' if m['is_boss'] else 'Нет'}</b> | 🦠 Баз. шанс зараж.: <b>{m['infect_chance']}%</b> | ID юнита: <code>{m['infected_unit_id']}</code>"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Имя", callback_data=f"am:f:{mob_id}:name:{page}"), InlineKeyboardButton(text="🖼 Фото", callback_data=f"am:f:{mob_id}:photo_id:{page}")],
+            [InlineKeyboardButton(text="❤️ HP", callback_data=f"am:f:{mob_id}:hp:{page}"), InlineKeyboardButton(text="🛡 Броня %", callback_data=f"am:f:{mob_id}:defense_percent:{page}")],
+            [InlineKeyboardButton(text="🦠 Шанс зараж.%", callback_data=f"am:f:{mob_id}:infect_chance:{page}"), InlineKeyboardButton(text="🔗 ID юнита", callback_data=f"am:f:{mob_id}:infected_unit_id:{page}")],
+            [InlineKeyboardButton(text="🗑 Удалить моба", callback_data=f"am:del:{mob_id}:{page}")],
+            [InlineKeyboardButton(text="🔙 К мобам", callback_data=f"adm:mobs:{page}")],
+        ]
+    )
+    await render_view(target, txt, kb, photo=m.get("photo_id") or None)
+
+
+@router.callback_query(F.data.startswith("am:ed:"))
+async def cb_am_ed(callback: CallbackQuery):
+    _, _, m_s, p_s = callback.data.split(":")
+    await render_adm_mob_editor(callback, int(m_s), int(p_s))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("am:f:"))
+async def cb_am_field(callback: CallbackQuery, state: FSMContext):
+    _, _, m_s, field, p_s = callback.data.split(":")
+    await state.set_state(MobEditFSM.waiting_value)
+    await state.update_data(mob_id=int(m_s), field=field, page=int(p_s))
+    await callback.message.answer(f"Введите новое значение для <b>{field}</b>:")
+    await callback.answer()
+
+
+@router.message(MobEditFSM.waiting_value)
+async def fsm_am_field_save(message: Message, state: FSMContext):
+    d = await state.get_data()
+    await state.clear()
+    mid, field, page = d["mob_id"], d["field"], d["page"]
+    try:
+        if field == "photo_id":
+            val: Any = message.photo[-1].file_id if message.photo else ""
+        elif field in ("hp", "defense_percent", "infect_chance", "infected_unit_id"):
+            val = int((message.text or "").strip())
+        else:
+            val = (message.text or "").strip()
+    except ValueError:
+        await message.answer("❌ Неверный формат.")
+        return
+    await db.update_mob(mid, **{field: val})
+    await message.answer("✅ Обновлено!")
+    await render_adm_mob_editor(message, mid, page)
+
+
+@router.callback_query(F.data.startswith("am:del:"))
+async def cb_am_del(callback: CallbackQuery):
+    _, _, m_s, p_s = callback.data.split(":")
+    await db.delete_mob(int(m_s))
+    await callback.answer("🗑 Моб удалён!", show_alert=True)
+    await render_adm_mobs(callback, int(p_s))
+
+
+# ==================== АДМИН: КАРТЫ И ТОЧЕЧНЫЙ РЕДАКТОР ВОЛН ====================
+
+async def render_adm_maps(target: Message | CallbackQuery, page: int = 0):
+    maps = await db.list_maps()
+    rows = [[InlineKeyboardButton(text="➕ Создать новую Карту", callback_data="amp:new")]]
+    for m in maps:
+        rows.append([InlineKeyboardButton(text=f"🗺 #{m['id']} {m['name']} ({len(m['waves'])} волн)", callback_data=f"amp:ed:{m['id']}")])
+    rows.append([InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")])
+    await render_view(target, f"🗺 <b>КАРТЫ И ВОЛНЫ</b> (Всего: {len(maps)})", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("adm:maps:"))
+async def cb_adm_maps(callback: CallbackQuery):
+    if not await db.has_perm(callback.from_user.id, "manage_maps"):
+        await callback.answer("Нет прав manage_maps!", show_alert=True)
+        return
+    await render_adm_maps(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "amp:new")
+async def cb_amp_new(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(MapCreateFSM.name)
+    await callback.message.answer("🗺 Введите <b>название карты</b>:")
+    await callback.answer()
+
+
+@router.message(MapCreateFSM.name)
+async def fsm_amp_name(message: Message, state: FSMContext):
+    await state.update_data(name=(message.text or "").strip())
+    await state.set_state(MapCreateFSM.photo)
+    await message.answer("🖼 Отправьте <b>фон карты</b> (фото для Pillow-рендера) или <code>-</code>:")
+
+
+@router.message(MapCreateFSM.photo)
+async def fsm_amp_photo(message: Message, state: FSMContext):
+    pid = message.photo[-1].file_id if message.photo else ""
+    await state.update_data(photo_id=pid)
+    await state.set_state(MapCreateFSM.rewards)
+    await message.answer("💰 Введите через пробел: <code>старт_монеты HP_базы награда_победа награда_поражение</code>\nПример: <code>150 100 350 50</code>")
+
+
+@router.message(MapCreateFSM.rewards)
+async def fsm_amp_rewards(message: Message, state: FSMContext):
+    p = (message.text or "").split()
+    try:
+        sc, bhp, wc, lc = int(p[0]), int(p[1]), int(p[2]), int(p[3])
+    except (ValueError, IndexError):
+        await message.answer("❌ Пример: <code>150 100 350 50</code>")
+        return
+    d = await state.get_data()
+    mid = await db.create_map({"name": d["name"], "photo_id": d["photo_id"], "starting_coins": sc, "base_hp": bhp, "win_coins": wc, "lose_coins": lc, "waves": [{"turns": 6, "mobs": []}]})
+    await db.log_admin(message.from_user.id, f"Создал карту #{mid} {d['name']}")
+    await state.clear()
+    await message.answer(f"✅ Карта <b>{esc(d['name'])}</b> создана! Теперь добавьте мобов в волны:")
+    await render_adm_map_editor(message, mid)
+
+
+async def render_adm_map_editor(target: Message | CallbackQuery, map_id: int):
+    m = await db.get_map(map_id)
+    if not m:
+        await render_adm_maps(target)
+        return
+    txt = (
+        f"🗺 <b>КАРТА #{m['id']} — {esc(m['name'])}</b>\n"
+        f"💰 Старт: {m['starting_coins']} | 🏰 База: {m['base_hp']} HP | 🏆 Победа: {m['win_coins']} | 📉 Пораж.: {m['lose_coins']}\n"
+        f"🌊 Волн: <b>{len(m['waves'])}</b>"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🌊 Редактор Волн (Точечный)", callback_data=f"mw:list:{map_id}")],
+            [InlineKeyboardButton(text="✏️ Имя", callback_data=f"amp:f:{map_id}:name"), InlineKeyboardButton(text="🖼 Фон", callback_data=f"amp:f:{map_id}:photo_id")],
+            [InlineKeyboardButton(text="🏆 Награда победа", callback_data=f"amp:f:{map_id}:win_coins"), InlineKeyboardButton(text="💰 Старт монеты", callback_data=f"amp:f:{map_id}:starting_coins")],
+            [InlineKeyboardButton(text="🗑 Удалить карту", callback_data=f"amp:del:{map_id}")],
+            [InlineKeyboardButton(text="🔙 К картам", callback_data="adm:maps:0")],
+        ]
+    )
+    await render_view(target, txt, kb, photo=m.get("photo_id") or None)
+
+
+@router.callback_query(F.data.startswith("amp:ed:"))
+async def cb_amp_ed(callback: CallbackQuery):
+    await render_adm_map_editor(callback, int(callback.data.split(":")[2]))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("amp:f:"))
+async def cb_amp_f(callback: CallbackQuery, state: FSMContext):
+    _, _, m_s, field = callback.data.split(":")
+    await state.set_state(MapWaveEditFSM.map_field)
+    await state.update_data(map_id=int(m_s), field=field)
+    await callback.message.answer(f"Введите новое значение для <b>{field}</b>:")
+    await callback.answer()
+
+
+@router.message(MapWaveEditFSM.map_field)
+async def fsm_amp_f_save(message: Message, state: FSMContext):
+    d = await state.get_data()
+    await state.clear()
+    mid, field = d["map_id"], d["field"]
+    try:
+        val: Any = (message.photo[-1].file_id if message.photo else "") if field == "photo_id" else (
+            int((message.text or "").strip()) if field in ("win_coins", "lose_coins", "starting_coins", "base_hp") else (message.text or "").strip()
+        )
+    except ValueError:
+        await message.answer("❌ Неверный формат.")
+        return
+    await db.update_map(mid, **{field: val})
+    await render_adm_map_editor(message, mid)
+
+
+@router.callback_query(F.data.startswith("amp:del:"))
+async def cb_amp_del(callback: CallbackQuery):
+    await db.delete_map(int(callback.data.split(":")[2]))
+    await callback.answer("🗑 Карта удалена!", show_alert=True)
+    await render_adm_maps(callback)
+
+
+async def render_wave_list(target: Message | CallbackQuery, map_id: int):
+    m = await db.get_map(map_id)
+    if not m:
+        return
+    rows, row = [], []
+    for i, _ in enumerate(m["waves"]):
+        row.append(InlineKeyboardButton(text=f"Волна {i + 1}", callback_data=f"mw:sel:{map_id}:{i}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="➕ Добавить волну в конец", callback_data=f"mw:addw:{map_id}")])
+    rows.append([InlineKeyboardButton(text="🔙 К карте", callback_data=f"amp:ed:{map_id}")])
+    await render_view(target, f"🌊 <b>Волны карты «{esc(m['name'])}»</b> ({len(m['waves'])} шт.)", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+async def render_wave_editor(target: Message | CallbackQuery, map_id: int, widx: int):
+    m = await db.get_map(map_id)
+    if not m or not (0 <= widx < len(m["waves"])):
+        return
+    w = m["waves"][widx]
+    all_mobs = {x["id"]: x for x in await db.list_mobs()}
+    lines = [f"🌊 <b>Волна {widx + 1}</b> (Карта: {esc(m['name'])})", f"⏱ Длительность: <b>{w['turns']} ходов</b>\n", "👾 <b>Мобы:</b>"]
+    if not w["mobs"]:
+        lines.append("<i>Пусто — добавьте мобов!</i>")
+    else:
+        for e in w["mobs"]:
+            mo = all_mobs.get(int(e["id"]))
+            lines.append(f"• {esc(mo['name']) if mo else '#' + str(e['id'])} ×<b>{e['count']}</b>")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить моба", callback_data=f"mw:amob:{map_id}:{widx}"), InlineKeyboardButton(text="⏱ Ходы", callback_data=f"mw:turn:{map_id}:{widx}")],
+            [InlineKeyboardButton(text="🧹 Очистить мобов", callback_data=f"mw:clr:{map_id}:{widx}"), InlineKeyboardButton(text="🗑 Удалить волну", callback_data=f"mw:delw:{map_id}:{widx}")],
+            [InlineKeyboardButton(text="🔙 К волнам", callback_data=f"mw:list:{map_id}")],
+        ]
+    )
+    await render_view(target, "\n".join(lines), kb)
+
+
+@router.callback_query(F.data.startswith("mw:list:"))
+async def cb_mw_list(callback: CallbackQuery):
+    await render_wave_list(callback, int(callback.data.split(":")[2]))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mw:addw:"))
+async def cb_mw_addw(callback: CallbackQuery):
+    mid = int(callback.data.split(":")[2])
+    m = await db.get_map(mid)
+    waves = list(m["waves"]) + [{"turns": 7, "mobs": []}]
+    await db.update_map(mid, waves=waves)
+    await render_wave_list(callback, mid)
+    await callback.answer("➕ Волна добавлена!")
+
+
+@router.callback_query(F.data.startswith("mw:sel:"))
+async def cb_mw_sel(callback: CallbackQuery):
+    _, _, m_s, w_s = callback.data.split(":")
+    await render_wave_editor(callback, int(m_s), int(w_s))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mw:clr:"))
+async def cb_mw_clr(callback: CallbackQuery):
+    _, _, m_s, w_s = callback.data.split(":")
+    mid, widx = int(m_s), int(w_s)
+    m = await db.get_map(mid)
+    m["waves"][widx]["mobs"] = []
+    await db.update_map(mid, waves=m["waves"])
+    await render_wave_editor(callback, mid, widx)
+    await callback.answer("Очищено!")
+
+
+@router.callback_query(F.data.startswith("mw:delw:"))
+async def cb_mw_delw(callback: CallbackQuery):
+    _, _, m_s, w_s = callback.data.split(":")
+    mid, widx = int(m_s), int(w_s)
+    m = await db.get_map(mid)
+    if len(m["waves"]) <= 1:
+        await callback.answer("Нельзя удалить последнюю волну!", show_alert=True)
+        return
+    m["waves"].pop(widx)
+    await db.update_map(mid, waves=m["waves"])
+    await render_wave_list(callback, mid)
+    await callback.answer("🗑 Удалено!")
+
+
+@router.callback_query(F.data.startswith("mw:amob:"))
+async def cb_mw_amob(callback: CallbackQuery):
+    _, _, m_s, w_s = callback.data.split(":")
+    mobs = await db.list_mobs()
+    rows, row = [], []
+    for mo in mobs:
+        ico = "👑" if mo["is_boss"] else "👾"
+        row.append(InlineKeyboardButton(text=f"{ico} {mo['name'][:14]}", callback_data=f"mw:smob:{m_s}:{w_s}:{mo['id']}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"mw:sel:{m_s}:{w_s}")])
+    await render_view(callback, "Выберите моба для волны:", InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mw:smob:"))
+async def cb_mw_smob(callback: CallbackQuery, state: FSMContext):
+    _, _, m_s, w_s, mob_s = callback.data.split(":")
+    await state.set_state(MapWaveEditFSM.mob_count)
+    await state.update_data(map_id=int(m_s), widx=int(w_s), mob_id=int(mob_s))
+    await callback.message.answer("🔢 Введите количество этих мобов:")
+    await callback.answer()
+
+
+@router.message(MapWaveEditFSM.mob_count)
+async def fsm_mw_mob_cnt(message: Message, state: FSMContext):
+    d = await state.get_data()
+    await state.clear()
+    try:
+        cnt = max(1, int((message.text or "").strip()))
+    except ValueError:
+        await message.answer("❌ Введите число.")
+        return
+    m = await db.get_map(d["map_id"])
+    m["waves"][d["widx"]]["mobs"].append({"id": d["mob_id"], "count": cnt})
+    await db.update_map(d["map_id"], waves=m["waves"])
+    await render_wave_editor(message, d["map_id"], d["widx"])
+
+
+@router.callback_query(F.data.startswith("mw:turn:"))
+async def cb_mw_turn(callback: CallbackQuery, state: FSMContext):
+    _, _, m_s, w_s = callback.data.split(":")
+    await state.set_state(MapWaveEditFSM.wave_turns)
+    await state.update_data(map_id=int(m_s), widx=int(w_s))
+    await callback.message.answer("⏱ Введите количество ходов на эту волну:")
+    await callback.answer()
+
+
+@router.message(MapWaveEditFSM.wave_turns)
+async def fsm_mw_turn_save(message: Message, state: FSMContext):
+    d = await state.get_data()
+    await state.clear()
+    try:
+        turns = max(1, int((message.text or "").strip()))
+    except ValueError:
+        await message.answer("❌ Введите число.")
+        return
+    m = await db.get_map(d["map_id"])
+    m["waves"][d["widx"]]["turns"] = turns
+    await db.update_map(d["map_id"], waves=m["waves"])
+    await render_wave_editor(message, d["map_id"], d["widx"])
+
+
+# ==================== АДМИН: КРЕЙТЫ ====================
+
+async def render_adm_crates(target: Message | CallbackQuery):
+    crates = await db.list_crates()
+    rows = [[InlineKeyboardButton(text="➕ Создать Крейт", callback_data="acr:new")]]
+    for c in crates:
+        st = "🟢" if c["active"] else "🔴"
+        rows.append([InlineKeyboardButton(text=f"{st} {c['name']} ({c['price']}💰)", callback_data=f"acr:ed:{c['id']}")])
+    rows.append([InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")])
+    await render_view(target, f"📦 <b>УПРАВЛЕНИЕ КРЕЙТАМИ</b> ({len(crates)})", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("adm:crates:"))
+async def cb_adm_crates(callback: CallbackQuery):
+    if not await db.has_perm(callback.from_user.id, "manage_crates"):
+        await callback.answer("Нет прав!", show_alert=True)
+        return
+    await render_adm_crates(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "acr:new")
+async def cb_acr_new(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(CrateFSM.name)
+    await state.update_data(units={})
+    await callback.message.answer("📦 Введите <b>название</b> крейта:")
+    await callback.answer()
+
+
+@router.message(CrateFSM.name)
+async def fsm_acr_name(message: Message, state: FSMContext):
+    await state.update_data(name=(message.text or "").strip())
+    await state.set_state(CrateFSM.price)
+    await message.answer("💰 Введите <b>цену</b> крейта и <b>описание</b> через `|` (например: <code>500 | Топовый кейс</code>):")
+
+
+@router.message(CrateFSM.price)
+async def fsm_acr_price(message: Message, state: FSMContext):
+    parts = (message.text or "").split("|", 1)
+    try:
+        price = int(parts[0].strip())
+    except ValueError:
+        await message.answer("❌ Пример: <code>500 | Описание</code>")
+        return
+    desc = parts[1].strip() if len(parts) > 1 else ""
+    await state.update_data(price=price, desc=desc)
+    await state.set_state(CrateFSM.photo)
+    await message.answer("🖼 Отправьте <b>фото</b> крейта (или <code>-</code>):")
+
+
+@router.message(CrateFSM.photo)
+async def fsm_acr_photo(message: Message, state: FSMContext):
+    pid = message.photo[-1].file_id if message.photo else ""
+    await state.update_data(photo_id=pid)
+    await _show_crate_builder(message, state)
+
+
+async def _show_crate_builder(target: Message | CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    u_map = d.get("units", {})
+    all_u = await db.list_units()
+    by_id = {str(x["id"]): x for x in all_u}
+    lines = [f"📦 <b>Состав крейта «{esc(d['name'])}»</b>:"]
+    for k, w in u_map.items():
+        lines.append(f"• {esc(by_id[k]['name']) if k in by_id else k} — вес <b>{w}</b>")
+    rows, row = [], []
+    for u in all_u:
+        row.append(InlineKeyboardButton(text=u["name"][:14], callback_data=f"acrb:u:{u['id']}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if u_map:
+        rows.append([InlineKeyboardButton(text="💾 Сохранить Крейт", callback_data="acrb:save")])
+    await state.set_state(CrateFSM.builder)
+    await render_view(target, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(CrateFSM.builder, F.data.startswith("acrb:u:"))
+async def cb_acrb_u(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(sel_u=callback.data.split(":")[2])
+    await state.set_state(CrateFSM.weight)
+    await callback.message.answer("⚖️ Введите вес выпадения (число, например <code>20</code>):")
+    await callback.answer()
+
+
+@router.message(CrateFSM.weight)
+async def fsm_acrb_w(message: Message, state: FSMContext):
+    try:
+        w = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("❌ Введите целое число.")
+        return
+    d = await state.get_data()
+    u_map = dict(d.get("units", {}))
+    u_map[d["sel_u"]] = w
+    await state.update_data(units=u_map)
+    await _show_crate_builder(message, state)
+
+
+@router.callback_query(CrateFSM.builder, F.data == "acrb:save")
+async def cb_acrb_save(callback: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    cid = await db.create_crate(d["name"], d["desc"], d["price"], d["photo_id"], d["units"])
+    await db.log_admin(callback.from_user.id, f"Создал крейт #{cid} {d['name']}")
+    await state.clear()
+    await callback.answer("✅ Крейт создан!", show_alert=True)
+    await render_adm_crates(callback)
+
+
+@router.callback_query(F.data.startswith("acr:ed:"))
+async def cb_acr_ed(callback: CallbackQuery):
+    cid = int(callback.data.split(":")[2])
+    c = await db.get_crate(cid)
+    if not c:
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"💰 Цена ({c['price']})", callback_data=f"acr:f:{cid}:price"), InlineKeyboardButton(text="✏️ Имя", callback_data=f"acr:f:{cid}:name")],
+            [InlineKeyboardButton(text=f"{'🔴 Выключить' if c['active'] else '🟢 Включить'}", callback_data=f"acr:tgl:{cid}"), InlineKeyboardButton(text="🗑 Удалить", callback_data=f"acr:del:{cid}")],
+            [InlineKeyboardButton(text="🔙 К крейтам", callback_data="adm:crates:0")],
+        ]
+    )
+    await render_view(callback, f"📦 <b>Крейт #{cid} — {esc(c['name'])}</b>\nЦена: {c['price']} 💰", kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("acr:f:"))
+async def cb_acr_f(callback: CallbackQuery, state: FSMContext):
+    _, _, cid_s, field = callback.data.split(":")
+    await state.set_state(CrateFSM.edit_field)
+    await state.update_data(cid=int(cid_s), field=field)
+    await callback.message.answer(f"Введите новое значение для <b>{field}</b>:")
+    await callback.answer()
+
+
+@router.message(CrateFSM.edit_field)
+async def fsm_acr_f_save(message: Message, state: FSMContext):
+    d = await state.get_data()
+    await state.clear()
+    try:
+        val: Any = int((message.text or "").strip()) if d["field"] == "price" else (message.text or "").strip()
+    except ValueError:
+        await message.answer("❌ Неверный формат.")
+        return
+    await db.update_crate(d["cid"], **{d["field"]: val})
+    await render_adm_crates(message)
+
+
+@router.callback_query(F.data.startswith("acr:tgl:"))
+async def cb_acr_tgl(callback: CallbackQuery):
+    cid = int(callback.data.split(":")[2])
+    c = await db.get_crate(cid)
+    await db.update_crate(cid, active=0 if c["active"] else 1)
+    await render_adm_crates(callback)
+    await callback.answer("Статус изменён!")
+
+
+@router.callback_query(F.data.startswith("acr:del:"))
+async def cb_acr_del(callback: CallbackQuery):
+    await db.delete_crate(int(callback.data.split(":")[2]))
+    await callback.answer("🗑 Удалено!", show_alert=True)
+    await render_adm_crates(callback)
+
+
+# ==================== АДМИН: НАСТРОЙКИ БАЛАНСА, МИРОВОЙ БОСС, ИГРОКИ, ПРАВА, БД ====================
+
+async def render_adm_settings(target: Message | CallbackQuery, page: int = 0):
+    keys = list(SETTING_META.keys())
+    per_page = 6
+    total_pages = max(1, (len(keys) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    chunk = keys[page * per_page : (page + 1) * per_page]
+
+    rows = []
+    for k in chunk:
+        title = SETTING_META[k][0]
+        cur_v = GAME_SETTINGS.get(k, DEFAULT_SETTINGS[k])
+        rows.append([InlineKeyboardButton(text=f"{title}: {cur_v}", callback_data=f"aset:{k}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:set:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm:set:{page + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")])
+    await render_view(target, "🎛 <b>НАСТРОЙКИ БАЛАНСА И ИВЕНТОВ</b>\nНажмите на параметр для изменения:", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("adm:set:"))
+async def cb_adm_set(callback: CallbackQuery):
+    if not await db.has_perm(callback.from_user.id, "manage_settings"):
+        await callback.answer("Нет прав!", show_alert=True)
+        return
+    await render_adm_settings(callback, int(callback.data.split(":")[2]))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("aset:"))
+async def cb_aset(callback: CallbackQuery, state: FSMContext):
+    _, key, p_s = callback.data.split(":")
+    title, vtype, mn, mx = SETTING_META[key]
+    await state.set_state(AdminFSM.setting_val)
+    await state.update_data(s_key=key, s_page=int(p_s))
+    await callback.message.answer(f"🎛 <b>{title}</b>\nТекущее: <code>{GAME_SETTINGS.get(key)}</code>\nВведите новое ({vtype}, от {mn} до {mx}):")
+    await callback.answer()
+
+
+@router.message(AdminFSM.setting_val)
+async def fsm_aset_save(message: Message, state: FSMContext):
+    d = await state.get_data()
+    await state.clear()
+    key, page = d["s_key"], d["s_page"]
+    _, vtype, mn, mx = SETTING_META[key]
+    try:
+        raw = (message.text or "").replace(",", ".").strip()
+        num = int(raw) if vtype == "int" else float(raw)
+        if not (mn <= num <= mx):
+            raise ValueError
+    except ValueError:
+        await message.answer(f"❌ Введите число от {mn} до {mx}.")
+        return
+    await db.set_setting(key, str(num))
+    await db.log_admin(message.from_user.id, f"Изменил настройку {key}={num}")
+    await message.answer(f"✅ Настройка <b>{key}</b> обновлена на <code>{num}</code>!")
+    await render_adm_settings(message, page)
+
+
+# --- МИРОВОЙ БОСС (АДМИН) ---
+
+@router.callback_query(F.data == "adm:wb")
+async def cb_adm_wb(callback: CallbackQuery):
+    if not await db.has_perm(callback.from_user.id, "manage_bosses"):
+        await callback.answer("Нет прав!", show_alert=True)
+        return
+    wb = await db.get_active_world_boss()
+    bosses = await db.list_mobs(only_bosses=True)
+    rows = []
+    if wb:
+        rows.append([InlineKeyboardButton(text="🛑 Остановить Мирового Босса", callback_data="awb:stop")])
+    for b in bosses:
+        rows.append([InlineKeyboardButton(text=f"🌍 Запустить: {b['name']}", callback_data=f"awb:sp:{b['id']}")])
+    rows.append([InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")])
+    st = f"Активен: <b>{esc(wb['name'])}</b> ({wb['current_hp']}/{wb['max_hp']} HP)" if wb else "Нет активного босса."
+    await render_view(callback, f"🌍 <b>УПРАВЛЕНИЕ МИРОВЫМ БОССОМ</b>\n{st}", InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "awb:stop")
+async def cb_awb_stop(callback: CallbackQuery):
+    await db.stop_world_boss()
+    await callback.answer("🛑 Остановлен!", show_alert=True)
+    await cb_adm_wb(callback)
+
+
+@router.callback_query(F.data.startswith("awb:sp:"))
+async def cb_awb_sp(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminFSM.wb_hp)
+    await state.update_data(wb_mob_id=int(callback.data.split(":")[2]))
+    await callback.message.answer("❤️ Введите запас <b>HP Мирового Босса</b> (например <code>25000</code>):")
+    await callback.answer()
+
+
+@router.message(AdminFSM.wb_hp)
+async def fsm_awb_hp(message: Message, state: FSMContext, bot: Bot):
+    d = await state.get_data()
+    await state.clear()
+    try:
+        hp = max(100, int((message.text or "").strip()))
+    except ValueError:
+        await message.answer("❌ Введите число.")
+        return
+    mob = await db.get_mob(d["wb_mob_id"])
+    await db.spawn_world_boss(mob["id"], hp)
+    await db.log_admin(message.from_user.id, f"Запустил Мирового Босса {mob['name']} ({hp} HP)")
+    await message.answer(f"🌍 Мировой Босс <b>{esc(mob['name'])}</b> ({hp} HP) запущен!")
+    for uid in await db.get_all_active_user_ids():
+        try:
+            await bot.send_message(uid, f"🚨🌍 <b>ПОЯВИЛСЯ МИРОВОЙ БОСС: {esc(mob['name'])}!</b>\n❤️ HP: <b>{hp}</b>\nЗаходи в «🌐 Мультиплеер → 🌍 Мировой Босс»!")
+        except Exception:
+            pass
+
+
+# --- ИГРОКИ И ЭКОНОМИКА ---
+
+@router.callback_query(F.data == "adm:users")
+async def cb_adm_users(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminFSM.find_user)
+    await callback.message.answer("👥 Введите <b>@username</b> или <b>Telegram ID</b> игрока:")
+    await callback.answer()
+
+
+@router.message(AdminFSM.find_user)
+async def fsm_adm_find_u(message: Message, state: FSMContext):
+    await state.clear()
+    u = await db.find_user(message.text or "")
+    if not u:
+        await message.answer("❌ Игрок не найден.")
+        return
+    await render_adm_user_card(message, u["user_id"])
+
+
+async def render_adm_user_card(target: Message | CallbackQuery, target_uid: int):
+    u = await db.get_user(target_uid)
+    txt = await build_profile_text(u, False) + f"\n\n🚫 Бан: <b>{'ДА' if u['is_banned'] else 'НЕТ'}</b>"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💰 +/- Монеты", callback_data=f"aus:coins:{target_uid}"), InlineKeyboardButton(text="🦠 +3 Обыч.", callback_data=f"aus:p:common:{target_uid}")],
+            [InlineKeyboardButton(text="💎 +3 Элит. паразита", callback_data=f"aus:p:elite:{target_uid}"), InlineKeyboardButton(text="🎁 Выдать Юнита", callback_data=f"aus:gu:{target_uid}")],
+            [InlineKeyboardButton(text="✅ Разбанить" if u["is_banned"] else "🚫 Забанить", callback_data=f"aus:ban:{target_uid}")],
+            [InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")],
+        ]
+    )
+    await render_view(target, txt, kb)
+
+
+@router.callback_query(F.data.startswith("aus:coins:"))
+async def cb_aus_coins(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminFSM.user_coins)
+    await state.update_data(t_uid=int(callback.data.split(":")[2]))
+    await callback.message.answer("💰 Введите сумму монет (отрицательное — списать, например <code>1000</code> или <code>-500</code>):")
+    await callback.answer()
+
+
+@router.message(AdminFSM.user_coins)
+async def fsm_aus_coins(message: Message, state: FSMContext):
+    d = await state.get_data()
+    await state.clear()
+    try:
+        delta = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("❌ Введите целое число.")
+        return
+    await db.add_coins(d["t_uid"], delta)
+    await db.log_admin(message.from_user.id, f"Изменил баланс {d['t_uid']} на {delta}")
+    await render_adm_user_card(message, d["t_uid"])
+
+
+@router.callback_query(F.data.startswith("aus:p:"))
+async def cb_aus_p(callback: CallbackQuery):
+    _, _, p_key, uid_s = callback.data.split(":")
+    await db.add_parasite(int(uid_s), p_key, 3)
+    await callback.answer("✅ Выдано +3 паразита!", show_alert=True)
+    await render_adm_user_card(callback, int(uid_s))
+
+
+@router.callback_query(F.data.startswith("aus:ban:"))
+async def cb_aus_ban(callback: CallbackQuery):
+    t_uid = int(callback.data.split(":")[2])
+    if t_uid == OWNER_ID:
+        await callback.answer("Нельзя забанить владельца!", show_alert=True)
+        return
+    u = await db.get_user(t_uid)
+    nxt = 0 if u["is_banned"] else 1
+    await db.update_user(t_uid, is_banned=nxt)
+    await db.log_admin(callback.from_user.id, f"Бан={nxt} для {t_uid}")
+    await render_adm_user_card(callback, t_uid)
+    await callback.answer("Статус бана изменён!")
+
+
+@router.callback_query(F.data.startswith("aus:gu:"))
+async def cb_aus_gu(callback: CallbackQuery):
+    t_uid = int(callback.data.split(":")[2])
+    units = await db.list_units()
+    rows = [[InlineKeyboardButton(text=f"#{u['id']} {u['name']}", callback_data=f"aus:do:{t_uid}:{u['id']}")] for u in units[:20]]
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm:home")])
+    await render_view(callback, f"🎁 Выберите юнита для выдачи игроку <code>{t_uid}</code>:", InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("aus:do:"))
+async def cb_aus_do(callback: CallbackQuery):
+    _, _, t_s, u_s = callback.data.split(":")
+    await db.give_unit(int(t_s), int(u_s))
+    await db.log_admin(callback.from_user.id, f"Выдал юнита #{u_s} игроку {t_s}")
+    await callback.answer("✅ Юнит выдан!", show_alert=True)
+    await render_adm_user_card(callback, int(t_s))
+
+
+# --- РАССЫЛКА ---
+
+@router.callback_query(F.data == "adm:bcast")
+async def cb_adm_bcast(callback: CallbackQuery, state: FSMContext):
+    if not await db.has_perm(callback.from_user.id, "broadcast"):
+        await callback.answer("Нет прав!", show_alert=True)
+        return
+    await state.set_state(AdminFSM.broadcast)
+    await callback.message.answer("📢 Отправьте сообщение (текст или фото с подписью) для рассылки всем игрокам:")
+    await callback.answer()
+
+
+@router.message(AdminFSM.broadcast)
+async def fsm_adm_bcast(message: Message, state: FSMContext):
+    await state.clear()
+    uids = await db.get_all_active_user_ids()
+    ok = 0
+    for uid in uids:
+        try:
+            await message.send_copy(chat_id=uid)
+            ok += 1
+            await asyncio.sleep(0.04)
+        except Exception:
+            pass
+    await db.log_admin(message.from_user.id, f"Рассылка: доставлено {ok}/{len(uids)}")
+    await message.answer(f"✅ Рассылка завершена! Доставлено: <b>{ok}/{len(uids)}</b>")
+
+
+# --- АДМИНЫ, ПАРТНЁРЫ-СИГНЕРЫ, ТЕХРАБОТЫ, ЛОГИ, БЭКАП И ВОССТАНОВЛЕНИЕ БД ---
+
+async def render_admins_list(target: Message | CallbackQuery):
+    admins = await db.list_admins()
+    rows = [[InlineKeyboardButton(text="➕ Добавить админа", callback_data="aadm:add")]]
+    for a in admins:
+        name = a["full_name"] or str(a["user_id"])
+        rows.append([InlineKeyboardButton(text=f"👮 {name} ({a['user_id']})", callback_data=f"aadm:ed:{a['user_id']}")])
+    rows.append([InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")])
+    await render_view(target, f"👮 <b>АДМИНИСТРАТОРЫ</b> (Владелец: <code>{OWNER_ID}</code>)", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data == "adm:admins")
+async def cb_adm_admins(callback: CallbackQuery):
+    if not await db.has_perm(callback.from_user.id, "manage_admins"):
+        await callback.answer("Нет прав!", show_alert=True)
+        return
+    await render_admins_list(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "aadm:add")
+async def cb_aadm_add(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminFSM.add_admin)
+    await callback.message.answer("👮 Введите <b>Telegram ID</b> или <b>@username</b> нового админа:")
+    await callback.answer()
+
+
+@router.message(AdminFSM.add_admin)
+async def fsm_aadm_add(message: Message, state: FSMContext):
+    await state.clear()
+    u = await db.find_user(message.text or "")
+    t_uid = u["user_id"] if u else (int(message.text.strip()) if (message.text or "").strip().isdigit() else 0)
+    if not t_uid or t_uid == OWNER_ID:
+        await message.answer("❌ Неверный ID.")
+        return
+    await db.add_admin(t_uid, message.from_user.id)
+    await db.log_admin(message.from_user.id, f"Добавил админа {t_uid}")
+    await render_admin_perms(message, t_uid)
+
+
+async def render_admin_perms(target: Message | CallbackQuery, t_uid: int):
+    perms = await db.get_admin_perms(t_uid)
+    rows = []
+    for k, label in ADMIN_PERMS.items():
+        ico = "✅" if perms.get(k) else "❌"
+        rows.append([InlineKeyboardButton(text=f"{ico} {label}", callback_data=f"aadm:tgl:{t_uid}:{k}")])
+    rows.append([InlineKeyboardButton(text="🗑 Снять админа", callback_data=f"aadm:del:{t_uid}")])
+    rows.append([InlineKeyboardButton(text="🔙 К списку", callback_data="adm:admins")])
+    await render_view(target, f"👮 <b>Права админа <code>{t_uid}</code></b>\nНажимайте на пункты для переключения:", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("aadm:ed:"))
+async def cb_aadm_ed(callback: CallbackQuery):
+    await render_admin_perms(callback, int(callback.data.split(":")[2]))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("aadm:tgl:"))
+async def cb_aadm_tgl(callback: CallbackQuery):
+    _, _, uid_s, perm = callback.data.split(":")
+    await db.toggle_admin_perm(int(uid_s), perm)
+    await render_admin_perms(callback, int(uid_s))
+    await callback.answer("Обновлено!")
+
+
+@router.callback_query(F.data.startswith("aadm:del:"))
+async def cb_aadm_del(callback: CallbackQuery):
+    t_uid = int(callback.data.split(":")[2])
+    await db.remove_admin(t_uid)
+    await db.log_admin(callback.from_user.id, f"Снял админа {t_uid}")
+    await callback.answer("🗑 Админ снят!", show_alert=True)
+    await render_admins_list(callback)
+
+
+@router.callback_query(F.data == "adm:signers")
+async def cb_adm_signers(callback: CallbackQuery):
+    if not await db.has_perm(callback.from_user.id, "manage_admins"):
+        await callback.answer("Нет прав!", show_alert=True)
+        return
+    signers = await db.list_signers()
+    rows = [[InlineKeyboardButton(text="➕ Добавить Партнёра (-10%)", callback_data="asgn:add")]]
+    for s in signers:
+        name = s["full_name"] or str(s["user_id"])
+        rows.append([InlineKeyboardButton(text=f"❌ {name} ({s['role']})", callback_data=f"asgn:del:{s['user_id']}")])
+    rows.append([InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")])
+    await render_view(
+        callback,
+        f"🤝 <b>ПАРТНЁРЫ-СИГНЕРЫ</b>\nПартнёры дают скидку <b>-{cfg_int('partner_sign_disc_pct')}%</b> на поставку/прокачку, Админы с правом <code>sign_admin</code> — <b>-{cfg_int('admin_sign_disc_pct')}%</b>.",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "asgn:add")
+async def cb_asgn_add(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminFSM.add_signer)
+    await callback.message.answer("🤝 Введите <b>@username</b> или <b>ID</b> игрока для выдачи роли Партнёра-Сигнера:")
+    await callback.answer()
+
+
+@router.message(AdminFSM.add_signer)
+async def fsm_asgn_add(message: Message, state: FSMContext):
+    await state.clear()
+    u = await db.find_user(message.text or "")
+    t_uid = u["user_id"] if u else (int(message.text.strip()) if (message.text or "").strip().isdigit() else 0)
+    if not t_uid:
+        await message.answer("❌ Игрок не найден.")
+        return
+    await db.set_signer(t_uid, "partner", message.from_user.id)
+    await message.answer(f"✅ Игрок <code>{t_uid}</code> назначен Партнёром-Сигнером!")
+
+
+@router.callback_query(F.data.startswith("asgn:del:"))
+async def cb_asgn_del(callback: CallbackQuery):
+    await db.remove_signer(int(callback.data.split(":")[2]))
+    await callback.answer("Снят!", show_alert=True)
+    await cb_adm_signers(callback)
+
+
+@router.callback_query(F.data == "adm:maint")
+async def cb_adm_maint(callback: CallbackQuery):
+    if not await db.has_perm(callback.from_user.id, "manage_admins"):
+        await callback.answer("Нет прав!", show_alert=True)
+        return
+    nxt = "0" if GAME_SETTINGS.get("maintenance") == "1" else "1"
+    await db.set_setting("maintenance", nxt)
+    await db.log_admin(callback.from_user.id, f"Техработы={nxt}")
+    await callback.answer("🛠 Техработы ВКЛ" if nxt == "1" else "🟢 Техработы ВЫКЛ", show_alert=True)
+    await render_admin_home(callback, callback.from_user.id)
+
+
+@router.callback_query(F.data == "adm:logs")
+async def cb_adm_logs(callback: CallbackQuery):
+    logs = await db.get_admin_logs(15)
+    lines = ["📋 <b>ПОСЛЕДНИЕ ДЕЙСТВИЯ АДМИНОВ</b>", "━━━━━━━━━━━━━━━━━━"]
+    for lg in logs:
+        ts = datetime.fromtimestamp(lg["created_at"]).strftime("%d.%m %H:%M")
+        lines.append(f"• [{ts}] <b>{esc(lg['full_name'] or lg['admin_id'])}</b>: {esc(lg['action'])}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В Админку", callback_data="adm:home")]])
+    await render_view(callback, "\n".join(lines), kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:backup")
+async def cb_adm_backup(callback: CallbackQuery):
+    if not await db.has_perm(callback.from_user.id, "manage_admins"):
+        await callback.answer("Нет прав!", show_alert=True)
+        return
+    await callback.message.answer_document(
+        FSInputFile(DB_PATH),
+        caption="💾 <b>Бэкап БД Skibidi Verse TD.</b>\nЧтобы восстановить БД, отправьте этот <code>.db</code> файл обратно боту (только Владелец).",
+    )
+    await callback.answer("Файл отправлен!")
+
+
+@router.message(F.document)
+async def handle_db_restore(message: Message, bot: Bot):
+    if message.from_user.id != OWNER_ID:
+        return
+    if not message.document or not (message.document.file_name or "").endswith(".db"):
+        return
+    file = await bot.get_file(message.document.file_id)
+    await bot.download_file(file.file_path, DB_PATH)
+    await db.reload_settings()
+    await message.answer("✅ <b>База данных успешно восстановлена!</b>")
+
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+# ==============================================================================
+# 12. ФОНОВЫЕ ЗАДАЧИ И ЗАПУСК БОТА
+# ==============================================================================
+
+async def auto_backup_task(bot: Bot) -> None:
+    while True:
+        await asyncio.sleep(12 * 3600)
+        try:
+            await bot.send_document(OWNER_ID, FSInputFile(DB_PATH), caption="🕒 Автобэкап БД (раз в 12ч).")
+        except Exception as exc:
+            logger.warning("Auto backup failed: %s", exc)
+
+
+async def hourly_crate_rotation_task() -> None:
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            for c in await db.list_crates():
+                banners = c.get("banners") or []
+                if len(banners) > 1:
+                    nxt = (c.get("current_banner", 0) + 1) % len(banners)
+                    await db.update_crate(c["id"], current_banner=nxt, units=banners[nxt]["units"])
+        except Exception as exc:
+            logger.warning("Crate rotation error: %s", exc)
+
+
+async def main() -> None:
+    await db.init()
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+
+    mw = AccessMiddleware()
+    dp.message.middleware(mw)
+    dp.callback_query.middleware(mw)
+    dp.include_router(router)
+
+    asyncio.create_task(auto_backup_task(bot))
+    asyncio.create_task(hourly_crate_rotation_task())
+
+    logger.info("🚀 Skibidi Verse Tower Defense Bot запущен! Владелец: %s", OWNER_ID)
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("🛑 Бот остановлен.")
