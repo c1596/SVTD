@@ -1,6 +1,9 @@
 """
-Skibidi Verse: Cards & Infection — Telegram Card RPG Bot (Thanksgiving Event Update)
+Skibidi Verse: Cards & Infection — Telegram Card RPG Bot (Thanksgiving Event, Часть 1 из 3)
 Стек: Python 3.10+, aiogram 3.x, aiosqlite (автоматическая установка при запуске).
+
+Сборка файла:
+Просто скопируй подряд Часть 1 + Часть 2 + Часть 3 в один файл bot.py.
 
 Что нового в обновлении:
 1. Вкладка «🦃 Ивент» (Thanksgiving Event) с переключением нижнего меню на 2×3 + выход:
@@ -11,9 +14,9 @@ Skibidi Verse: Cards & Infection — Telegram Card RPG Bot (Thanksgiving Event U
    в админке, без модификаторов и с наградой в новой валюте 🍗 Turkey Legs.
 3. В ивентовых крейтах показывается только выбранный админом крейт.
 4. Честный Luck: шанс 0.3% при x2 становится ровно 0.6% (перераспределение с частых карт).
-5. Казуальный скейлинг ИИ (вражеский Strider в Hard больше не имеет 440–1000 HP)
-   + прокачка карт даёт и ATK, и HP за уровень.
-6. Расширенная Админ-панель: отдельный редактор Thanksgiving Event и 29 настроек баланса.
+5. Казуальный скейлинг ИИ (вражеский Strider в Hard больше не улетает в 1000 HP)
+   + прокачка карт даёт и ATK, и HP за каждый уровень.
+6. Расширенная Админ-панель: отдельный редактор Thanksgiving Event и 31 настройка баланса.
 """
 
 import asyncio
@@ -183,7 +186,7 @@ DEFAULT_SETTINGS: Dict[str, str] = {
 
 GAME_SETTINGS: Dict[str, str] = dict(DEFAULT_SETTINGS)
 
-# 29 настраиваемых параметров в разделе «🎛 Баланс» Админ-панели
+# 31 настраиваемый параметр в разделе «🎛 Баланс» Админ-панели
 SETTING_META: Dict[str, Tuple[str, str, float, float]] = {
     "ai_easy_mult": ("🟢 Статы ИИ: Easy (x)", "float", 0.3, 5.0),
     "ai_med_mult": ("🟡 Статы ИИ: Medium (x)", "float", 0.3, 5.0),
@@ -437,13 +440,13 @@ def calc_crate_probs(
     if luck_mult <= 1.0 or len(base_entries) <= 1:
         return base_entries
 
-    # Определяем «частые» карты крейта (самая низкая редкость внутри этого крейта)
+    # Определяем «частые» карты крейта (минимальная редкость внутри этого крейта)
     # и «редкие» (все карты более высоких редкостей).
     min_rw = min(get_rarity(co["rarity"])["weight"] for co, _ in base_entries)
     rare_items = [(co, p) for co, p in base_entries if get_rarity(co["rarity"])["weight"] > min_rw]
     common_items = [(co, p) for co, p in base_entries if get_rarity(co["rarity"])["weight"] <= min_rw]
 
-    # Если в крейте все карты одной редкости — бустим те, у которых шанс ниже среднего (напр. крафтовые)
+    # Если все карты одной редкости — бустим те, у которых шанс ниже среднего (напр. крафтовые)
     if not rare_items or not common_items:
         avg_p = 100.0 / len(base_entries)
         rare_items = [(co, p) for co, p in base_entries if p < avg_p]
@@ -982,6 +985,11 @@ class Database:
             await conn.execute(f"UPDATE users SET {cols} WHERE user_id = ?", [*kw.values(), uid])
             await conn.commit()
 
+    async def reset_all_event_modes(self) -> None:
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute("UPDATE users SET in_event_mode = 0")
+            await conn.commit()
+
     async def add_coins(self, uid: int, delta: int) -> None:
         async with aiosqlite.connect(self.path) as conn:
             await conn.execute("UPDATE users SET coins = MAX(0, coins + ?) WHERE user_id = ?", (delta, uid))
@@ -1318,4 +1326,276 @@ class Database:
             await conn.commit()
             return cur.lastrowid
 
-    async def update_crate(self, cid:
+    async def update_crate(self, cid: int, **kw: Any) -> None:
+        if "cards" in kw:
+            kw["cards_json"] = json.dumps(kw.pop("cards"))
+        if not kw:
+            return
+        cols = ", ".join(f"{k} = ?" for k in kw)
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(f"UPDATE crates SET {cols} WHERE id = ?", [*kw.values(), cid])
+            await conn.commit()
+
+    async def delete_crate(self, cid: int) -> None:
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute("DELETE FROM crates WHERE id = ?", (cid,))
+            await conn.commit()
+
+    # -------------------- P2P Рынок (комиссия из market_comm_pct) --------------------
+
+    async def list_market(self) -> List[Dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            rows = await (await conn.execute(
+                """
+                SELECT m.id AS market_id, m.seller_id, m.inv_id, m.price,
+                       i.level, i.xp, i.is_shiny, i.is_infected, i.serial_number, i.sign_type, i.signed_by,
+                       c.name, c.faction, c.rarity, c.class_type, c.hp, c.atk, c.booster_dmg_mult, c.booster_hp_mult, c.photo_id,
+                       u.full_name AS seller_name
+                FROM market m
+                JOIN inventory i ON m.inv_id = i.id
+                JOIN cards c ON i.card_id = c.id
+                LEFT JOIN users u ON m.seller_id = u.user_id
+                ORDER BY m.id DESC
+                """
+            )).fetchall()
+            return [dict(r) for r in rows]
+
+    async def create_market_lot(self, seller_id: int, inv_id: int, price: int) -> None:
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute("UPDATE inventory SET equip_slot = 0 WHERE id = ?", (inv_id,))
+            await conn.execute("INSERT INTO market (seller_id, inv_id, price, created_at) VALUES (?, ?, ?, ?)", (seller_id, inv_id, price, int(time.time())))
+            await conn.commit()
+
+    async def buy_market_lot(self, market_id: int, buyer_id: int) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        comm_pct = max(0, min(50, cfg_int("market_comm_pct")))
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            lot = await (await conn.execute(
+                "SELECT m.*, i.card_id, c.name FROM market m JOIN inventory i ON m.inv_id = i.id JOIN cards c ON i.card_id = c.id WHERE m.id = ?",
+                (market_id,),
+            )).fetchone()
+            if not lot:
+                return False, "Лот уже куплен или снят.", None
+            if lot["seller_id"] == buyer_id:
+                return False, "Нельзя купить свой собственный лот.", None
+            buyer = await (await conn.execute("SELECT coins FROM users WHERE user_id = ?", (buyer_id,))).fetchone()
+            if not buyer or buyer["coins"] < lot["price"]:
+                return False, f"Недостаточно монет! Нужно {lot['price']} 💰.", None
+
+            price = lot["price"]
+            payout = int(price * (100 - comm_pct) / 100)
+            comm = price - payout
+            await conn.execute("UPDATE users SET coins = coins - ? WHERE user_id = ?", (price, buyer_id))
+            await conn.execute("UPDATE users SET coins = coins + ? WHERE user_id = ?", (payout, lot["seller_id"]))
+            if comm > 0:
+                await conn.execute("UPDATE users SET coins = coins + ? WHERE user_id = ?", (comm, OWNER_ID))
+            await conn.execute("UPDATE inventory SET user_id = ?, equip_slot = 0 WHERE id = ?", (buyer_id, lot["inv_id"]))
+            await conn.execute("INSERT OR IGNORE INTO user_discovered (user_id, card_id) VALUES (?, ?)", (buyer_id, lot["card_id"]))
+            await conn.execute("DELETE FROM market WHERE id = ?", (market_id,))
+            await conn.commit()
+            res = dict(lot)
+            res["payout"] = payout
+            res["seller_pct"] = 100 - comm_pct
+            return True, "Покупка успешна!", res
+
+    async def cancel_market_lot(self, market_id: int, seller_id: int) -> bool:
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute("DELETE FROM market WHERE id = ? AND seller_id = ?", (market_id, seller_id))
+            await conn.commit()
+            return cur.rowcount > 0
+
+    # -------------------- Мировой Босс --------------------
+
+    async def get_world_boss(self) -> Optional[Dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            r = await (await conn.execute(
+                "SELECT wb.*, c.name, c.rarity, c.photo_id FROM world_boss wb JOIN cards c ON wb.card_id = c.id WHERE wb.active = 1 ORDER BY wb.id DESC LIMIT 1"
+            )).fetchone()
+            return dict(r) if r else None
+
+    async def spawn_world_boss(self, card_id: int, max_hp: int) -> None:
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute("UPDATE world_boss SET active = 0 WHERE active = 1")
+            await conn.execute("INSERT INTO world_boss (card_id, max_hp, current_hp, active, created_at) VALUES (?, ?, ?, 1, ?)", (card_id, max_hp, max_hp, int(time.time())))
+            await conn.commit()
+
+    async def stop_world_boss(self) -> None:
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute("UPDATE world_boss SET active = 0 WHERE active = 1")
+            await conn.commit()
+
+    async def get_wb_hit(self, bid: int, uid: int) -> Optional[Dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            r = await (await conn.execute("SELECT * FROM world_boss_hits WHERE boss_id = ? AND user_id = ?", (bid, uid))).fetchone()
+            return dict(r) if r else None
+
+    async def hit_wb(self, bid: int, uid: int, dmg: float) -> int:
+        now = int(time.time())
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                "INSERT INTO world_boss_hits (boss_id, user_id, damage, last_hit) VALUES (?, ?, ?, ?) ON CONFLICT(boss_id, user_id) DO UPDATE SET damage = damage + excluded.damage, last_hit = excluded.last_hit",
+                (bid, uid, dmg, now),
+            )
+            await conn.execute("UPDATE world_boss SET current_hp = MAX(0, current_hp - ?) WHERE id = ?", (int(dmg), bid))
+            rem = (await (await conn.execute("SELECT current_hp FROM world_boss WHERE id = ?", (bid,))).fetchone())[0]
+            if rem <= 0:
+                await conn.execute("UPDATE world_boss SET active = 0 WHERE id = ?", (bid,))
+            await conn.commit()
+            return rem
+
+    async def get_wb_top(self, bid: int, limit: int = 10) -> List[Dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            return [dict(r) for r in await (await conn.execute("SELECT h.user_id, h.damage, u.username, u.full_name FROM world_boss_hits h LEFT JOIN users u ON h.user_id = u.user_id WHERE h.boss_id = ? ORDER BY h.damage DESC LIMIT ?", (bid, limit))).fetchall()]
+
+    # -------------------- Топы и Глобальная статистика --------------------
+
+    async def get_leaderboard(self, col: str, limit: int = 10) -> List[Dict[str, Any]]:
+        c = col if col in {"trophies", "wins", "infections_success", "total_damage", "coins"} else "trophies"
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            return [dict(r) for r in await (await conn.execute(f"SELECT user_id, username, full_name, {c} AS val FROM users WHERE is_banned = 0 ORDER BY {c} DESC LIMIT ?", (limit,))).fetchall()]
+
+    async def get_stats(self) -> Dict[str, int]:
+        async with aiosqlite.connect(self.path) as conn:
+            return {
+                "users": (await (await conn.execute("SELECT COUNT(*) FROM users")).fetchone())[0],
+                "cards": (await (await conn.execute("SELECT COUNT(*) FROM cards")).fetchone())[0],
+                "rarities": (await (await conn.execute("SELECT COUNT(*) FROM rarities")).fetchone())[0],
+                "crates": (await (await conn.execute("SELECT COUNT(*) FROM crates")).fetchone())[0],
+                "currencies": (await (await conn.execute("SELECT COUNT(*) FROM currencies")).fetchone())[0],
+                "market": (await (await conn.execute("SELECT COUNT(*) FROM market")).fetchone())[0],
+                "child_bots": (await (await conn.execute("SELECT COUNT(*) FROM child_bots")).fetchone())[0],
+            }
+
+
+db = Database(DB_PATH)
+
+
+# ==============================================================================
+# 3. МЕНЕДЖЕР ДОЧЕРНИХ БОТОВ (ДИНАМИЧЕСКИЙ POLLING ЧЕРЕЗ feed_update)
+# ==============================================================================
+
+BOT_COMMANDS_LIST = [
+    BotCommand(command="start", description="Главное меню / Показать кнопки"),
+    BotCommand(command="linkbot", description="Привязать своего бота (макс. 2)"),
+]
+
+
+class ChildBotManager:
+    """Управляет запуском, остановкой и мониторингом дочерних ботов в реальном времени."""
+
+    def __init__(self) -> None:
+        self.tasks: Dict[int, asyncio.Task] = {}
+        self.bots: Dict[int, Bot] = {}
+
+    def is_running(self, cb_id: int) -> bool:
+        t = self.tasks.get(cb_id)
+        return bool(t and not t.done())
+
+    async def start_bot(self, cb_row: Dict[str, Any]) -> Tuple[bool, str]:
+        cb_id = cb_row["id"]
+        if self.is_running(cb_id):
+            return True, "Бот уже запущен."
+        if cb_row.get("is_banned"):
+            return False, "Бот заблокирован администрацией."
+        if not MAIN_DP:
+            return False, "Диспетчер не инициализирован."
+
+        bot = Bot(token=cb_row["token"], default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        try:
+            me = await bot.get_me()
+            await bot.set_my_commands(BOT_COMMANDS_LIST)
+            await bot.delete_webhook(drop_pending_updates=True)
+            await db.update_child_bot(cb_id, bot_id=me.id, username=me.username or "", title=me.full_name or "", is_active=1, last_error="")
+        except Exception as exc:
+            await bot.session.close()
+            err = str(exc)[:180]
+            await db.update_child_bot(cb_id, is_active=0, last_error=err)
+            return False, f"Ошибка запуска: {err}"
+
+        self.bots[cb_id] = bot
+        self.tasks[cb_id] = asyncio.create_task(self._poll_loop(cb_id, bot, cb_row["owner_id"]))
+        logger.info("🤖 Дочерний бот #%s (@%s) запущен!", cb_id, me.username)
+        return True, f"Бот @{me.username} запущен!"
+
+    async def stop_bot(self, cb_id: int, mark_db_inactive: bool = True) -> None:
+        task = self.tasks.pop(cb_id, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        bot = self.bots.pop(cb_id, None)
+        if bot:
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
+        if mark_db_inactive:
+            await db.update_child_bot(cb_id, is_active=0)
+
+    async def start_all_active(self) -> int:
+        started = 0
+        for row in await db.list_child_bots():
+            if row["is_active"] and not row["is_banned"]:
+                ok, _ = await self.start_bot(row)
+                if ok:
+                    started += 1
+        return started
+
+    async def stop_all(self, mark_db_inactive: bool = False) -> None:
+        for cb_id in list(self.tasks.keys()):
+            await self.stop_bot(cb_id, mark_db_inactive=mark_db_inactive)
+
+    async def _safe_feed(self, bot: Bot, update: Any) -> None:
+        try:
+            if MAIN_DP:
+                await MAIN_DP.feed_update(bot, update)
+        except Exception as exc:
+            logger.exception("Child bot update error: %s", exc)
+
+    async def _poll_loop(self, cb_id: int, bot: Bot, owner_id: int) -> None:
+        offset = 0
+        allowed = MAIN_DP.resolve_used_update_types() if MAIN_DP else ["message", "callback_query"]
+        try:
+            while True:
+                try:
+                    updates = await bot.get_updates(offset=offset, timeout=25, allowed_updates=allowed)
+                    if updates:
+                        await db.inc_child_bot_updates(cb_id, len(updates))
+                    for upd in updates:
+                        offset = upd.update_id + 1
+                        asyncio.create_task(self._safe_feed(bot, upd))
+                except TelegramUnauthorizedError:
+                    await db.update_child_bot(cb_id, is_active=0, last_error="Токен отозван или недействителен")
+                    if MAIN_BOT:
+                        try:
+                            await MAIN_BOT.send_message(owner_id, f"⚠️ Ваш дочерний бот #{cb_id} остановлен: токен стал недействительным.")
+                        except Exception:
+                            pass
+                    break
+                except TelegramConflictError:
+                    await db.update_child_bot(cb_id, last_error="Конфликт polling (бот запущен где-то ещё)")
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    await db.update_child_bot(cb_id, last_error=str(exc)[:180])
+                    await asyncio.sleep(3)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.tasks.pop(cb_id, None)
+            self.bots.pop(cb_id, None)
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
+
+
+child_manager = ChildBotManager()
